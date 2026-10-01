@@ -24,11 +24,20 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn two_batches_read_distinct_ps_uniforms_in_one_submit() {
-    pollster::block_on(run_test());
+    pollster::block_on(run_test(1));
 }
 
+/// Past the ring's initial 1024 slots the device grows it mid-phase; draws on
+/// both sides of the growth still read their own uniforms.
+#[test]
+fn draws_past_the_initial_ring_capacity_grow_it() {
+    pollster::block_on(run_test(1500));
+}
+
+/// Draws the red left quad `left_draws` times, then the green right quad once,
+/// all in one onscreen phase.
 #[allow(clippy::too_many_lines)]
-async fn run_test() {
+async fn run_test(left_draws: u32) {
     let instance =
         wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
     let adapter = instance
@@ -42,7 +51,7 @@ async fn run_test() {
         .expect("no wgpu adapter available");
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
-            label: Some("noesis_runtime uniform-ring test device"),
+            label: Some("noesis_wgpu uniform-ring test device"),
             required_features: wgpu::Features::empty(),
             required_limits: wgpu::Limits::downlevel_defaults(),
             memory_hints: wgpu::MemoryHints::default(),
@@ -152,7 +161,9 @@ async fn run_test() {
     let left = make_rgba_batch(0, 0, &identity_mat, &red);
     let right = make_rgba_batch(48, 6, &identity_mat, &green);
 
-    rd.draw_batch_with(&left, BatchTextures::default());
+    for _ in 0..left_draws {
+        rd.draw_batch_with(&left, BatchTextures::default());
+    }
     rd.draw_batch_with(&right, BatchTextures::default());
     rd.end_onscreen_render();
 

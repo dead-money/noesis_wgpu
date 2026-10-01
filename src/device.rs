@@ -39,7 +39,7 @@ const PS_UNIFORM0_SIZE: u64 = 32;
 // First 8 floats of cbuffer1_ps (float[128] in the SDK); SHADOW reads 7, BLUR 1.
 const PS_UNIFORM1_SIZE: u64 = 32;
 
-// Max `draw_batch` calls per render phase; `UniformRing::write` panics past it.
+// Initial `draw_batch_with` calls per render phase; the rings double past it.
 const UNIFORM_RING_SLOTS: u32 = 1024;
 
 /// Color format every RT allocates with, and the format the pipeline cache
@@ -93,12 +93,7 @@ pub struct WgpuRenderDevice {
     vertex_stream: GeometryStream,
     index_stream: GeometryStream,
 
-    vs_ring: UniformRing,
-    vs_uniform_bind_group: wgpu::BindGroup,
-    // group(1): `ps_ring` at binding 0, `ps1_ring` at binding 1.
-    ps_ring: UniformRing,
-    ps1_ring: UniformRing,
-    ps_uniform_bind_group: wgpu::BindGroup,
+    uniforms: UniformRings,
 
     // group(2) paint texture. Shaders without one bind `dummy_pattern_bg`.
     pattern_bind_group_layout: wgpu::BindGroupLayout,
@@ -199,109 +194,7 @@ impl WgpuRenderDevice {
             wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         );
 
-        let uniform_alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
-        let vs_ring = UniformRing::new(
-            &device,
-            "noesis_wgpu vs_uniforms ring (mat4 projection)",
-            VS_UNIFORM_SIZE,
-            UNIFORM_RING_SLOTS,
-            uniform_alignment,
-        );
-        let ps_ring = UniformRing::new(
-            &device,
-            "noesis_wgpu ps_uniforms0 ring (cbuffer0_ps[8])",
-            PS_UNIFORM0_SIZE,
-            UNIFORM_RING_SLOTS,
-            uniform_alignment,
-        );
-        let ps1_ring = UniformRing::new(
-            &device,
-            "noesis_wgpu ps_uniforms1 ring (cbuffer1_ps[8])",
-            PS_UNIFORM1_SIZE,
-            UNIFORM_RING_SLOTS,
-            uniform_alignment,
-        );
-
-        let vs_uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("noesis_wgpu vs_uniforms layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: true,
-                        min_binding_size: NonZeroU64::new(VS_UNIFORM_SIZE),
-                    },
-                    count: None,
-                }],
-            });
-        let ps_uniform_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("noesis_wgpu ps_uniforms layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: true,
-                            min_binding_size: NonZeroU64::new(PS_UNIFORM0_SIZE),
-                        },
-                        count: None,
-                    },
-                    // cbuffer1_ps: only SHADOW / BLUR read it, but the shared
-                    // layout always declares it so every pipeline matches.
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: true,
-                            min_binding_size: NonZeroU64::new(PS_UNIFORM1_SIZE),
-                        },
-                        count: None,
-                    },
-                ],
-            });
-
-        // Bind groups expose a *single* struct-sized window into each ring
-        // buffer. The dynamic offset passed to set_bind_group slides that
-        // window to the per-batch slot.
-        let vs_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu vs_uniforms"),
-            layout: &vs_uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: vs_ring.buffer(),
-                    offset: 0,
-                    size: NonZeroU64::new(VS_UNIFORM_SIZE),
-                }),
-            }],
-        });
-        let ps_uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu ps_uniforms"),
-            layout: &ps_uniform_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: ps_ring.buffer(),
-                        offset: 0,
-                        size: NonZeroU64::new(PS_UNIFORM0_SIZE),
-                    }),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                        buffer: ps1_ring.buffer(),
-                        offset: 0,
-                        size: NonZeroU64::new(PS_UNIFORM1_SIZE),
-                    }),
-                },
-            ],
-        });
+        let uniforms = UniformRings::new(&device);
 
         // Group(2): pattern texture + pattern sampler. Shared layout for
         // both PAINT_PATTERN draws and the dummy used by non-pattern draws.
@@ -441,8 +334,8 @@ impl WgpuRenderDevice {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("noesis_wgpu pipeline layout"),
             bind_group_layouts: &[
-                Some(&vs_uniform_bind_group_layout),
-                Some(&ps_uniform_bind_group_layout),
+                Some(&uniforms.vs_layout),
+                Some(&uniforms.ps_layout),
                 Some(&pattern_bind_group_layout),
                 Some(&image_bind_group_layout),
             ],
@@ -456,11 +349,7 @@ impl WgpuRenderDevice {
             queue,
             vertex_stream,
             index_stream,
-            vs_ring,
-            vs_uniform_bind_group,
-            ps_ring,
-            ps1_ring,
-            ps_uniform_bind_group,
+            uniforms,
             pattern_bind_group_layout,
             dummy_pattern_bg,
             samplers: HashMap::new(),
@@ -674,14 +563,13 @@ impl WgpuRenderDevice {
             .min(VS_UNIFORM_SIZE as usize - VS_GLYPH_SIZE_OFFSET);
         vs_buf[VS_GLYPH_SIZE_OFFSET..VS_GLYPH_SIZE_OFFSET + cbuf1_len]
             .copy_from_slice(&cbuf1[..cbuf1_len]);
-        let vs_offset = self.vs_ring.write(&self.queue, &vs_buf);
-        let ps_offset = self
-            .ps_ring
-            .write(&self.queue, batch.pixel_uniforms[0].as_bytes());
-        let ps1_offset = self
-            .ps1_ring
-            .write(&self.queue, batch.pixel_uniforms[1].as_bytes());
-        (vs_offset, ps_offset, ps1_offset)
+        self.uniforms.write(
+            &self.device,
+            &self.queue,
+            &vs_buf,
+            batch.pixel_uniforms[0].as_bytes(),
+            batch.pixel_uniforms[1].as_bytes(),
+        )
     }
 }
 
@@ -693,13 +581,14 @@ const fn align_up_u64(n: u64, align: u64) -> u64 {
     (n + align - 1) & !(align - 1)
 }
 
-/// One uniform buffer split into slots, one per `draw_batch`. The bind group
-/// covers one slot at offset 0 and the dynamic offset selects the slot.
+/// One uniform buffer split into slots, one per draw. The bind group covers
+/// one slot at offset 0 and the dynamic offset selects the slot.
 /// `write_buffer` calls all land before the phase's submit, so a shared slot
 /// would leave every draw reading the last batch's values. Reset at each
 /// `begin_*_render`.
 struct UniformRing {
     buffer: wgpu::Buffer,
+    label: &'static str,
     /// Bytes the shader actually reads from each slot.
     struct_size: u64,
     /// Distance between slot starts: `struct_size` rounded up to
@@ -714,15 +603,11 @@ struct UniformRing {
 impl UniformRing {
     fn new(
         device: &wgpu::Device,
-        label: &str,
+        label: &'static str,
         struct_size: u64,
         slot_capacity: u32,
-        alignment: u64,
     ) -> Self {
-        assert!(
-            struct_size.is_multiple_of(4),
-            "uniform struct_size must be a multiple of 4"
-        );
+        let alignment = u64::from(device.limits().min_uniform_buffer_offset_alignment);
         let slot_stride = align_up_u64(struct_size, alignment);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -732,6 +617,7 @@ impl UniformRing {
         });
         Self {
             buffer,
+            label,
             struct_size,
             slot_stride,
             slot_capacity,
@@ -740,8 +626,15 @@ impl UniformRing {
         }
     }
 
-    fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+    fn is_full(&self) -> bool {
+        self.next_slot == self.slot_capacity
+    }
+
+    /// Replaces the buffer with an empty one of twice the slots. Draws already
+    /// recorded keep the old buffer alive through the encoder, so nothing is
+    /// copied.
+    fn grow(&mut self, device: &wgpu::Device) {
+        *self = Self::new(device, self.label, self.struct_size, self.slot_capacity * 2);
     }
 
     fn reset(&mut self) {
@@ -749,18 +642,8 @@ impl UniformRing {
     }
 
     /// Uploads `bytes` (truncated or zero-padded to `struct_size`) to the next
-    /// slot and returns its dynamic offset.
-    ///
-    /// # Panics
-    ///
-    /// Panics past `slot_capacity` writes in one phase.
+    /// slot and returns its dynamic offset. The caller grows a full ring first.
     fn write(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> u32 {
-        assert!(
-            self.next_slot < self.slot_capacity,
-            "uniform ring (struct_size={}) exhausted at {} slots; raise UNIFORM_RING_SLOTS",
-            self.struct_size,
-            self.slot_capacity,
-        );
         let slot = self.next_slot;
         self.next_slot += 1;
         let offset = u64::from(slot) * self.slot_stride;
@@ -772,6 +655,160 @@ impl UniformRing {
 
         u32::try_from(offset).expect("uniform ring offset overflowed u32")
     }
+}
+
+/// The per-draw uniform rings and the bind groups that window them: group(0)
+/// holds the vertex uniforms, group(1) `cbuffer0_ps` at binding 0 and
+/// `cbuffer1_ps` at binding 1. The three rings fill in step, one slot per draw,
+/// and grow together.
+struct UniformRings {
+    vs: UniformRing,
+    ps0: UniformRing,
+    ps1: UniformRing,
+    vs_layout: wgpu::BindGroupLayout,
+    ps_layout: wgpu::BindGroupLayout,
+    vs_bind_group: wgpu::BindGroup,
+    ps_bind_group: wgpu::BindGroup,
+}
+
+impl UniformRings {
+    fn new(device: &wgpu::Device) -> Self {
+        let vs = UniformRing::new(
+            device,
+            "noesis_wgpu vs_uniforms ring (mat4 projection)",
+            VS_UNIFORM_SIZE,
+            UNIFORM_RING_SLOTS,
+        );
+        let ps0 = UniformRing::new(
+            device,
+            "noesis_wgpu ps_uniforms0 ring (cbuffer0_ps[8])",
+            PS_UNIFORM0_SIZE,
+            UNIFORM_RING_SLOTS,
+        );
+        let ps1 = UniformRing::new(
+            device,
+            "noesis_wgpu ps_uniforms1 ring (cbuffer1_ps[8])",
+            PS_UNIFORM1_SIZE,
+            UNIFORM_RING_SLOTS,
+        );
+
+        let uniform_entry = |binding, visibility, size| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: NonZeroU64::new(size),
+            },
+            count: None,
+        };
+        let vs_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("noesis_wgpu vs_uniforms layout"),
+            entries: &[uniform_entry(
+                0,
+                wgpu::ShaderStages::VERTEX,
+                VS_UNIFORM_SIZE,
+            )],
+        });
+        // cbuffer1_ps: only SHADOW / BLUR read it, but the shared layout always
+        // declares it so every pipeline matches.
+        let ps_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("noesis_wgpu ps_uniforms layout"),
+            entries: &[
+                uniform_entry(0, wgpu::ShaderStages::FRAGMENT, PS_UNIFORM0_SIZE),
+                uniform_entry(1, wgpu::ShaderStages::FRAGMENT, PS_UNIFORM1_SIZE),
+            ],
+        });
+
+        let vs_bind_group = vs_bind_group(device, &vs_layout, &vs);
+        let ps_bind_group = ps_bind_group(device, &ps_layout, &ps0, &ps1);
+        Self {
+            vs,
+            ps0,
+            ps1,
+            vs_layout,
+            ps_layout,
+            vs_bind_group,
+            ps_bind_group,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.vs.reset();
+        self.ps0.reset();
+        self.ps1.reset();
+    }
+
+    /// Uploads one draw's uniforms and returns the `(vs, ps0, ps1)` dynamic
+    /// offsets, doubling the rings first when they are full.
+    fn write(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        vs: &[u8],
+        ps0: &[u8],
+        ps1: &[u8],
+    ) -> (u32, u32, u32) {
+        if self.vs.is_full() {
+            self.vs.grow(device);
+            self.ps0.grow(device);
+            self.ps1.grow(device);
+            self.vs_bind_group = vs_bind_group(device, &self.vs_layout, &self.vs);
+            self.ps_bind_group = ps_bind_group(device, &self.ps_layout, &self.ps0, &self.ps1);
+        }
+        (
+            self.vs.write(queue, vs),
+            self.ps0.write(queue, ps0),
+            self.ps1.write(queue, ps1),
+        )
+    }
+}
+
+/// A bind group exposing one struct-sized window into each ring buffer. The
+/// dynamic offset passed to `set_bind_group` slides it to the draw's slot.
+fn ring_binding(ring: &UniformRing) -> wgpu::BindingResource<'_> {
+    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+        buffer: &ring.buffer,
+        offset: 0,
+        size: NonZeroU64::new(ring.struct_size),
+    })
+}
+
+fn vs_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    vs: &UniformRing,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("noesis_wgpu vs_uniforms"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: ring_binding(vs),
+        }],
+    })
+}
+
+fn ps_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    ps0: &UniformRing,
+    ps1: &UniformRing,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("noesis_wgpu ps_uniforms"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: ring_binding(ps0),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: ring_binding(ps1),
+            },
+        ],
+    })
 }
 
 /// Growable vertex or index buffer for one render phase. Noesis maps and
@@ -1330,9 +1367,7 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
-        self.vs_ring.reset();
-        self.ps_ring.reset();
-        self.ps1_ring.reset();
+        self.uniforms.reset();
         self.vertex_stream.reset();
         self.index_stream.reset();
         self.encoder = Some(
@@ -1374,9 +1409,7 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
-        self.vs_ring.reset();
-        self.ps_ring.reset();
-        self.ps1_ring.reset();
+        self.uniforms.reset();
         self.vertex_stream.reset();
         self.index_stream.reset();
         self.encoder = Some(
@@ -1605,8 +1638,8 @@ impl WgpuRenderDevice {
         let pipeline = self.pipelines.get(key);
         let vertex_buffer = self.vertex_stream.buffer();
         let index_buffer = self.index_stream.buffer();
-        let vs_bg = &self.vs_uniform_bind_group;
-        let ps_bg = &self.ps_uniform_bind_group;
+        let vs_bg = &self.uniforms.vs_bind_group;
+        let ps_bg = &self.uniforms.ps_bind_group;
         let pattern_bg = if let Some(slot) = pattern_slot {
             self.pattern_bind_groups
                 .get(&slot)

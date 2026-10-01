@@ -10,6 +10,11 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 - **Breaking:** moved to wgpu 30. The 0.1 line stays on wgpu 29 for Bevy 0.19.
 
+### Fixed
+
+- A render phase is no longer limited to 1024 draws. The per-draw uniform rings
+  double when they fill instead of panicking.
+
 ## [0.1.0]
 
 First release, on wgpu 29. The render device from `noesis_bevy` 0.15, as a
