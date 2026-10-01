@@ -1,0 +1,92 @@
+[package]
+name = "noesis_wgpu"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+authors = ["Brandon Reinhart <brandon@deadmoney.gg>"]
+description = "A wgpu render device for the Noesis GUI Native SDK: draws Noesis's batches on a wgpu device and queue you provide."
+repository = "https://github.com/dead-money/noesis_wgpu"
+documentation = "https://docs.rs/noesis_wgpu"
+license = "MIT"
+readme = "README.md"
+keywords = ["noesis", "wgpu", "xaml", "gui", "ui"]
+categories = ["gui", "game-development", "graphics", "rendering"]
+# Dev-only files that consumers of the published crate don't need.
+exclude = [".github/", ".claude/", "scripts/", "CLAUDE.md", "RELEASING.md", "release.toml"]
+
+# docs.rs has no Noesis SDK; noesis_runtime's build script skips the native
+# build when DOCS_RS is set.
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+log = "0.4"
+noesis_runtime = { path = "../noesis_runtime", version = "0.13" }
+wgpu = "29.0.3"
+
+[dev-dependencies]
+bytemuck = "1.25"
+pollster = "0.4"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+# Curated lint set shared with noesis_runtime and noesis_bevy, minus the
+# FFI-only `mem_forget` allowance: this crate forbids unsafe code.
+[lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+indexing_slicing = "allow"
+many_single_char_names = "allow"
+
+# `panic`: render-device phase guards.
+panic = "allow"
+
+# Correctness
+unnecessary_cast = "warn"
+as_underscore = "warn"
+ptr_as_ptr = "warn"
+clone_on_ref_ptr = "warn"
+cloned_instead_of_copied = "warn"
+explicit_iter_loop = "warn"
+explicit_into_iter_loop = "warn"
+invalid_upcast_comparisons = "warn"
+mixed_read_write_in_expression = "warn"
+index_refutable_slice = "warn"
+string_slice = "warn"
+
+# Style
+doc_markdown = "warn"
+equatable_if_let = "warn"
+if_not_else = "warn"
+implicit_saturating_sub = "warn"
+inconsistent_struct_constructor = "warn"
+mismatching_type_param_order = "warn"
+branches_sharing_code = "warn"
+manual_assert = "warn"
+mut_mut = "warn"
+needless_continue = "warn"
+option_option = "warn"
+range_minus_one = "warn"
+range_plus_one = "warn"
+redundant_else = "warn"
+ref_option_ref = "warn"
+unnested_or_patterns = "warn"
+unneeded_field_pattern = "warn"
+zero_sized_map_values = "warn"
+
+# Perf
+inefficient_to_string = "warn"
+large_types_passed_by_value = "warn"
+
+# Reminders
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+
+# Cargo
+wildcard_dependencies = "warn"
+
+[[test]]
+name = "wgpu_suite"
+path = "tests/wgpu_suite/main.rs"
