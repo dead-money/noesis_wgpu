@@ -30,8 +30,13 @@ jobs:
             exit 1
           }
 
-      - name: cargo test
-        run: cargo test --all-features
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: cargo nextest run
+        run: cargo nextest run --profile ci --all-features
 
       # Skip if this version is already on crates.io, so a re-run stays green.
       - name: Check if version already published

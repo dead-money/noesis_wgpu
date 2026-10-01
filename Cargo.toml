@@ -12,7 +12,7 @@ readme = "README.md"
 keywords = ["noesis", "wgpu", "xaml", "gui", "ui"]
 categories = ["gui", "game-development", "graphics", "rendering"]
 # Dev-only files that consumers of the published crate don't need.
-exclude = [".github/", ".claude/", "scripts/", "CLAUDE.md", "RELEASING.md", "release.toml"]
+exclude = [".config/", ".github/", ".claude/", "scripts/", "CLAUDE.md", "RELEASING.md", "release.toml"]
 
 # docs.rs has no Noesis SDK; noesis_runtime's build script skips the native
 # build when DOCS_RS is set.
