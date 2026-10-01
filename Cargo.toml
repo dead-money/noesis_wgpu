@@ -1,6 +1,6 @@
 [package]
 name = "noesis_wgpu"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.87"
 authors = ["Brandon Reinhart <brandon@deadmoney.gg>"]
@@ -29,7 +29,7 @@ shim = ["noesis_runtime/shim"]
 [dependencies]
 log = "0.4"
 noesis_runtime = { path = "../noesis_runtime", version = "0.13", default-features = false }
-wgpu = "29.0.3"
+wgpu = "30.0.1"
 
 [dev-dependencies]
 bytemuck = "1.25"

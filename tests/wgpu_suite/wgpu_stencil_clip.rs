@@ -32,6 +32,7 @@ async fn run_test() {
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
+            apply_limit_buckets: false,
             compatible_surface: None,
             force_fallback_adapter: false,
         })
@@ -198,7 +199,7 @@ async fn run_test() {
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
     receiver.recv().expect("readback recv").expect("map");
 
-    let data = slice.get_mapped_range();
+    let data = slice.get_mapped_range().expect("mapped range");
     let pixel = |x: u32, y: u32| -> [u8; 4] {
         let o = (y * BYTES_PER_ROW + x * 4) as usize;
         [data[o], data[o + 1], data[o + 2], data[o + 3]]

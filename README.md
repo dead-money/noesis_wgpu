@@ -23,8 +23,8 @@ Without the `shim` feature, nothing here or in `noesis_runtime` touches the SDK:
 ```toml
 [dependencies]
 noesis_runtime = "0.13"
-noesis_wgpu = "0.1"
-wgpu = "29"
+noesis_wgpu = "0.2"
+wgpu = "30"
 ```
 
 Create the device on your wgpu device and queue, point it at the texture Noesis should draw into, and register it with `noesis_runtime`:
@@ -68,7 +68,7 @@ A host that receives Noesis's render-device calls some other way, such as a C# `
 ```toml
 [dependencies]
 noesis_runtime = { version = "0.13", default-features = false }
-noesis_wgpu = { version = "0.1", default-features = false }
+noesis_wgpu = { version = "0.2", default-features = false }
 ```
 
 That host creates Noesis's texture objects, so it knows which `TextureHandle` each texture pointer in a `Batch` stands for. It passes them with the batch:
@@ -100,6 +100,7 @@ What it doesn't do yet: MSAA render targets (Noesis's offscreen sample count mus
 
 | noesis_wgpu | wgpu | Bevy (through noesis_bevy) |
 |-------------|------|----------------------------|
+| 0.2         | 30   |                            |
 | 0.1         | 29   | 0.19                       |
 
 wgpu types are part of the API, so each wgpu major gets a new `noesis_wgpu` minor. Older lines get fixes on `release/0.N` branches while a `noesis_bevy` release still uses them.

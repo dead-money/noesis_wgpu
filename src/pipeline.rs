@@ -286,7 +286,7 @@ fn build_pipeline(
             module: &module,
             entry_point: Some("vs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            buffers: &[vertex_layout],
+            buffers: &[Some(vertex_layout)],
         },
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
