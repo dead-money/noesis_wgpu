@@ -13,16 +13,13 @@
 
 ## `noesis_runtime` versions
 
-`Cargo.toml` names `noesis_runtime` by path (`../noesis_runtime`) and version.
-The path is for developing against the sibling checkout; `cargo publish` drops
-it and uses the version. CI checks out this repo alone, so drop the `path`
-once the `noesis_runtime` version this crate needs is on crates.io, and
-publish `noesis_runtime` first.
-
-Until then, a dry run has to resolve `noesis_runtime` from the checkout:
+`Cargo.toml` takes `noesis_runtime` from crates.io, and CI checks out this
+repo alone. When a change needs an unreleased `noesis_runtime`, develop
+against the sibling checkout with a local patch, and publish `noesis_runtime`
+first:
 
 ```sh
-cargo publish --dry-run --config 'patch.crates-io.noesis_runtime.path="../noesis_runtime"'
+cargo test --config 'patch.crates-io.noesis_runtime.path="../noesis_runtime"'
 ```
 
 ## Release lines
