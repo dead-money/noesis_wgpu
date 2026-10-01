@@ -77,6 +77,7 @@ jobs:
     name: build • clippy • test
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, noesis-sdk]
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v6

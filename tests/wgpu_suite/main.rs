@@ -14,3 +14,15 @@ mod wgpu_shadow_blur;
 mod wgpu_skipped_draws;
 mod wgpu_stencil_clip;
 mod wgpu_uniform_ring;
+
+// The native backends, unless `WGPU_BACKEND` names others. GL is left out because EGL setup
+// hangs when several tests start it at once without a display session, as on a CI runner
+// service.
+fn instance() -> wgpu::Instance {
+    let mut descriptor = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    if wgpu::Backends::from_env().is_none() {
+        descriptor.backends = wgpu::Backends::PRIMARY;
+    }
+
+    wgpu::Instance::new(descriptor)
+}
