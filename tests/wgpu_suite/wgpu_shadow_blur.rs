@@ -8,18 +8,16 @@
 //!           alpha = mix(image(uv-offset).a, shadow(uv-offset).a, cb1[6]).
 //!   BLUR:   mix(image(uv1), shadow(uv1), cb1[0]) * (opacity * paint.a).
 //!
-//! Drives `WgpuRenderDevice` directly, using `test_set_forced_image` and
-//! `test_set_forced_shadow` to point the two group(3) slots at solid 1x1
-//! textures. The constants are chosen so the formulas collapse to known colors.
+//! Drives `WgpuRenderDevice` directly, passing solid 1x1 textures for the
+//! two group(3) slots, sampled nearest (the default sampler state). The constants are chosen so the formulas collapse to known colors.
 
 use std::ffi::c_void;
 
 use noesis_runtime::render_device::types::{
-    Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
-    TextureFormat, UniformData, WrapMode,
+    Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, TextureFormat, UniformData,
 };
-use noesis_runtime::render_device::{RenderDevice, RenderTargetDesc, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_runtime::render_device::{RenderTargetDesc, TextureDesc};
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 4;
 const BYTES_PER_ROW: u32 = 256; // wgpu COPY_BYTES_PER_ROW_ALIGNMENT
@@ -33,15 +31,7 @@ const IDENTITY: [f32; 16] = [
 
 #[test]
 fn shadow_and_blur_effects() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -68,12 +58,6 @@ async fn run_test() {
         .await
         .expect("no wgpu device");
     let mut rd = WgpuRenderDevice::new(device.clone(), queue.clone());
-
-    let nearest = SamplerState::new(
-        WrapMode::ClampToEdge,
-        MinMagFilter::Nearest,
-        MipFilter::Disabled,
-    );
 
     // BLUR: mix(red image, green shadow, 0.75)
     // cbuffer1_ps[0] = 0.75 crossfade; paint = opaque white vertex color so
@@ -113,8 +97,11 @@ async fn run_test() {
     // cbuffer1_ps: only [0] is read (= crossfade 0.75).
     let blur_cb1: [f32; 8] = [0.75, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
 
-    rd.test_set_forced_image(Some((image_tex.handle, nearest)));
-    rd.test_set_forced_shadow(Some((shadow_tex.handle, nearest)));
+    let textures = BatchTextures {
+        image: Some(image_tex.handle),
+        shadow: Some(shadow_tex.handle),
+        ..BatchTextures::default()
+    };
     rd.begin_offscreen_render();
     rd.set_render_target(rt.handle);
     rd.map_vertices(blur_vb.len() as u32)
@@ -123,7 +110,7 @@ async fn run_test() {
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
     rd.begin_tile(rt.handle, full_tile());
-    rd.draw_batch(&effect_batch(Shader::BLUR, &blur_cb1));
+    rd.draw_batch_with(&effect_batch(Shader::BLUR, &blur_cb1), textures);
     rd.end_tile(rt.handle);
     rd.resolve_render_target(rt.handle, &[]);
     rd.end_offscreen_render();
@@ -170,8 +157,11 @@ async fn run_test() {
     // blend factor cb1[6] = 1.0 (take the shadow texture's alpha).
     let shadow_cb1: [f32; 8] = [0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0];
 
-    rd.test_set_forced_image(Some((s_image.handle, nearest)));
-    rd.test_set_forced_shadow(Some((s_shadow.handle, nearest)));
+    let textures = BatchTextures {
+        image: Some(s_image.handle),
+        shadow: Some(s_shadow.handle),
+        ..BatchTextures::default()
+    };
     rd.begin_offscreen_render();
     rd.set_render_target(rt2.handle);
     rd.map_vertices(shadow_vb.len() as u32)
@@ -180,12 +170,10 @@ async fn run_test() {
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
     rd.begin_tile(rt2.handle, full_tile());
-    rd.draw_batch(&effect_batch(Shader::SHADOW, &shadow_cb1));
+    rd.draw_batch_with(&effect_batch(Shader::SHADOW, &shadow_cb1), textures);
     rd.end_tile(rt2.handle);
     rd.resolve_render_target(rt2.handle, &[]);
     rd.end_offscreen_render();
-    rd.test_set_forced_image(None);
-    rd.test_set_forced_shadow(None);
 
     let shadow = read_pixel(&device, &queue, &rd, rt2.resolve_texture.handle, 2, 2).await;
     // (transparent_img + (1-0)*(blue * 1)) * 1 = blue.
@@ -257,12 +245,11 @@ fn effect_batch(shader: Shader, cb1: &[f32; 8]) -> Batch {
         num_vertices: 6,
         start_index: 0,
         num_indices: 6,
-        // Never dereferenced: the forced image/shadow hooks replace these.
         pattern: std::ptr::null_mut(),
         ramps: std::ptr::null_mut(),
-        image: std::ptr::dangling_mut(),
+        image: std::ptr::null_mut(),
         glyphs: std::ptr::null_mut(),
-        shadow: std::ptr::dangling_mut(),
+        shadow: std::ptr::null_mut(),
         pattern_sampler: SamplerState::default(),
         ramps_sampler: SamplerState::default(),
         image_sampler: SamplerState::default(),

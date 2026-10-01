@@ -7,12 +7,12 @@
 
 use std::ffi::c_void;
 
+use noesis_runtime::render_device::TextureDesc;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
     TextureFormat, UniformData, WrapMode,
 };
-use noesis_runtime::render_device::{RenderDevice, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 128;
 const TARGET_H: u32 = 128;
@@ -24,15 +24,7 @@ const RAMP_W: u32 = 256;
 
 #[test]
 fn radial_variants_sample_ramp_at_computed_radius() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -176,7 +168,10 @@ async fn run_test() {
         MinMagFilter::Nearest,
         MipFilter::Disabled,
     );
-    rd.test_set_forced_pattern(Some((ramp_binding.handle, sampler_state)));
+    let textures = BatchTextures {
+        ramps: Some(ramp_binding.handle),
+        ..BatchTextures::default()
+    };
 
     rd.begin_onscreen_render();
 
@@ -195,7 +190,7 @@ async fn run_test() {
         &ps_uniform0,
         sampler_state,
     );
-    rd.draw_batch(&radial);
+    rd.draw_batch_with(&radial, textures);
 
     let aa_radial = make_radial_batch(
         Shader::PATH_AA_RADIAL,
@@ -207,10 +202,9 @@ async fn run_test() {
         &ps_uniform0,
         sampler_state,
     );
-    rd.draw_batch(&aa_radial);
+    rd.draw_batch_with(&aa_radial, textures);
 
     rd.end_onscreen_render();
-    rd.test_set_forced_pattern(None);
 
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -330,9 +324,7 @@ fn make_radial_batch(
         start_index,
         num_indices,
         pattern: std::ptr::null_mut(),
-        // Never dereferenced: `test_set_forced_pattern` replaces the paint
-        // texture, ramps included.
-        ramps: std::ptr::dangling_mut(),
+        ramps: std::ptr::null_mut(),
         image: std::ptr::null_mut(),
         glyphs: std::ptr::null_mut(),
         shadow: std::ptr::null_mut(),

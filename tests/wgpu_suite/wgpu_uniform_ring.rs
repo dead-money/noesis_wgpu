@@ -10,11 +10,10 @@
 
 use std::ffi::c_void;
 
-use noesis_runtime::render_device::RenderDevice;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, UniformData,
 };
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 256;
 const TARGET_H: u32 = 256;
@@ -25,15 +24,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn two_batches_read_distinct_ps_uniforms_in_one_submit() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -160,8 +151,8 @@ async fn run_test() {
     let left = make_rgba_batch(0, 0, &identity_mat, &red);
     let right = make_rgba_batch(48, 6, &identity_mat, &green);
 
-    rd.draw_batch(&left);
-    rd.draw_batch(&right);
+    rd.draw_batch_with(&left, BatchTextures::default());
+    rd.draw_batch_with(&right, BatchTextures::default());
     rd.end_onscreen_render();
 
     let readback = device.create_buffer(&wgpu::BufferDescriptor {

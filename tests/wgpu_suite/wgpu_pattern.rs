@@ -15,8 +15,8 @@ use noesis_runtime::render_device::types::{
     Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
     TextureFormat, UniformData, WrapMode,
 };
-use noesis_runtime::render_device::{RenderDevice, RenderTargetDesc, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_runtime::render_device::{RenderTargetDesc, TextureDesc};
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 4;
 const BYTES_PER_ROW: u32 = 256; // wgpu COPY_BYTES_PER_ROW_ALIGNMENT
@@ -25,15 +25,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn path_pattern_samples_from_registered_texture() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -149,7 +141,10 @@ async fn run_test() {
     );
 
     // Standalone wgpu tests can't produce a Noesis-owned `Texture*`.
-    rd.test_set_forced_pattern(Some((pattern_binding.handle, sampler_state)));
+    let textures = BatchTextures {
+        pattern: Some(pattern_binding.handle),
+        ..BatchTextures::default()
+    };
 
     rd.begin_offscreen_render();
     rd.set_render_target(rt.handle);
@@ -170,12 +165,11 @@ async fn run_test() {
     );
 
     let batch = make_pattern_batch(&identity_mat, &ps_uniform0, sampler_state);
-    rd.draw_batch(&batch);
+    rd.draw_batch_with(&batch, textures);
 
     rd.end_tile(rt.handle);
     rd.resolve_render_target(rt.handle, &[]);
     rd.end_offscreen_render();
-    rd.test_set_forced_pattern(None);
 
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -281,8 +275,7 @@ fn make_pattern_batch(
         num_vertices: 6,
         start_index: 0,
         num_indices: 6,
-        // Never dereferenced: `test_set_forced_pattern` replaces it.
-        pattern: std::ptr::dangling_mut(),
+        pattern: std::ptr::null_mut(),
         ramps: std::ptr::null_mut(),
         image: std::ptr::null_mut(),
         glyphs: std::ptr::null_mut(),

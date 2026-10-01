@@ -19,9 +19,16 @@ exclude = [".github/", ".claude/", "scripts/", "CLAUDE.md", "RELEASING.md", "rel
 [package.metadata.docs.rs]
 all-features = true
 
+[features]
+default = ["shim"]
+# Implements noesis_runtime's `RenderDevice` trait, so the device can be
+# registered with noesis_runtime's C++ shim. Turn it off for a host that drives
+# the device directly; that build needs no Noesis SDK.
+shim = ["noesis_runtime/shim"]
+
 [dependencies]
 log = "0.4"
-noesis_runtime = { path = "../noesis_runtime", version = "0.13" }
+noesis_runtime = { path = "../noesis_runtime", version = "0.13", default-features = false }
 wgpu = "29.0.3"
 
 [dev-dependencies]

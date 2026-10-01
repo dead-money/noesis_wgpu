@@ -8,11 +8,10 @@
 
 use std::ffi::c_void;
 
-use noesis_runtime::render_device::RenderDevice;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, UniformData,
 };
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 256;
 const TARGET_H: u32 = 256;
@@ -23,15 +22,7 @@ const RED: [u8; 4] = [255, 0, 0, 255];
 
 #[test]
 fn stencil_clip_gates_content_to_masked_region() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -157,8 +148,11 @@ async fn run_test() {
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
 
-    rd.draw_batch(&mask_batch(&identity_mat));
-    rd.draw_batch(&content_batch(content_offset, 6, &identity_mat));
+    rd.draw_batch_with(&mask_batch(&identity_mat), BatchTextures::default());
+    rd.draw_batch_with(
+        &content_batch(content_offset, 6, &identity_mat),
+        BatchTextures::default(),
+    );
 
     rd.end_onscreen_render();
 

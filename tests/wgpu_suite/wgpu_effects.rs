@@ -7,11 +7,10 @@
 use std::ffi::c_void;
 
 use noesis_runtime::render_device::types::{
-    Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
-    TextureFormat, UniformData, WrapMode,
+    Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, TextureFormat, UniformData,
 };
-use noesis_runtime::render_device::{RenderDevice, RenderTargetDesc, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_runtime::render_device::{RenderTargetDesc, TextureDesc};
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 4;
 const BYTES_PER_ROW: u32 = 256; // wgpu COPY_BYTES_PER_ROW_ALIGNMENT
@@ -25,15 +24,7 @@ const IDENTITY: [f32; 16] = [
 
 #[test]
 fn downsample_and_upsample_resolve_chain() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -60,12 +51,6 @@ async fn run_test() {
         .await
         .expect("no wgpu device");
     let mut rd = WgpuRenderDevice::new(device.clone(), queue.clone());
-
-    let nearest = SamplerState::new(
-        WrapMode::ClampToEdge,
-        MinMagFilter::Nearest,
-        MipFilter::Disabled,
-    );
 
     // DOWNSAMPLE: 2×2 red/green/blue/yellow → average.
     let src_texels: [u8; 2 * 2 * 4] = [
@@ -98,7 +83,10 @@ async fn run_test() {
     let ds_vb = pos_tex0_tex1_quad([0.5, 0.5], [0.25, 0.25]);
     let ib = quad_indices();
 
-    rd.test_set_forced_pattern(Some((src.handle, nearest)));
+    let textures = BatchTextures {
+        pattern: Some(src.handle),
+        ..BatchTextures::default()
+    };
     rd.begin_offscreen_render();
     rd.set_render_target(rt.handle);
     rd.map_vertices(ds_vb.len() as u32).copy_from_slice(&ds_vb);
@@ -106,11 +94,10 @@ async fn run_test() {
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
     rd.begin_tile(rt.handle, full_tile());
-    rd.draw_batch(&effect_batch(Shader::DOWNSAMPLE));
+    rd.draw_batch_with(&effect_batch(Shader::DOWNSAMPLE), textures);
     rd.end_tile(rt.handle);
     rd.resolve_render_target(rt.handle, &[]);
     rd.end_offscreen_render();
-    rd.test_set_forced_pattern(None);
 
     let avg = read_pixel(&device, &queue, &rd, rt.resolve_texture.handle, 2, 2).await;
     // Mean of red/green/blue/yellow = (127.5, 127.5, 63.75, 255).
@@ -150,8 +137,11 @@ async fn run_test() {
     // mix weight; uv0/uv1 = (0.5, 0.5) sample the solid 1×1 textures.
     let us_vb = pos_color_tex0_tex1_quad([0, 0, 0, 128], [0.5, 0.5], [0.5, 0.5]);
 
-    rd.test_set_forced_pattern(Some((pattern_tex.handle, nearest)));
-    rd.test_set_forced_image(Some((image_tex.handle, nearest)));
+    let textures = BatchTextures {
+        pattern: Some(pattern_tex.handle),
+        image: Some(image_tex.handle),
+        ..BatchTextures::default()
+    };
     rd.begin_offscreen_render();
     rd.set_render_target(rt2.handle);
     rd.map_vertices(us_vb.len() as u32).copy_from_slice(&us_vb);
@@ -159,12 +149,10 @@ async fn run_test() {
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
     rd.begin_tile(rt2.handle, full_tile());
-    rd.draw_batch(&effect_batch(Shader::UPSAMPLE));
+    rd.draw_batch_with(&effect_batch(Shader::UPSAMPLE), textures);
     rd.end_tile(rt2.handle);
     rd.resolve_render_target(rt2.handle, &[]);
     rd.end_offscreen_render();
-    rd.test_set_forced_pattern(None);
-    rd.test_set_forced_image(None);
 
     let blend = read_pixel(&device, &queue, &rd, rt2.resolve_texture.handle, 2, 2).await;
     // mix(red, green, ~0.5) = (~127, ~128, 0, 255).
@@ -241,10 +229,9 @@ fn effect_batch(shader: Shader) -> Batch {
         num_vertices: 6,
         start_index: 0,
         num_indices: 6,
-        // Never dereferenced: the forced pattern/image hooks replace these.
-        pattern: std::ptr::dangling_mut(),
+        pattern: std::ptr::null_mut(),
         ramps: std::ptr::null_mut(),
-        image: std::ptr::dangling_mut(),
+        image: std::ptr::null_mut(),
         glyphs: std::ptr::null_mut(),
         shadow: std::ptr::null_mut(),
         pattern_sampler: SamplerState::default(),

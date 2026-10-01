@@ -3,7 +3,7 @@
 //! - `create_texture` + `update_texture` + `drop_texture` round-trip.
 //! - `create_render_target` (single-sampled, with stencil requested).
 //! - `begin_offscreen_render` → `set_render_target` → `begin_tile` (scissor)
-//!   → `map_vertices`/`map_indices` → `draw_batch` → `end_tile` →
+//!   → `map_vertices`/`map_indices` → `draw_batch_with` → `end_tile` →
 //!   `resolve_render_target` → `end_offscreen_render`.
 //! - Readback confirms the tile scissor clipped rendering and that two batches
 //!   in one submit read distinct uniforms (the uniform ring).
@@ -16,8 +16,8 @@ use std::ffi::c_void;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, TextureFormat, UniformData,
 };
-use noesis_runtime::render_device::{RenderDevice, RenderTargetDesc, TextureDesc, TextureRect};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_runtime::render_device::{RenderTargetDesc, TextureDesc, TextureRect};
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 128;
 const BYTES_PER_ROW: u32 = RT_SIZE * 4;
@@ -26,15 +26,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn offscreen_rt_scissored_draw_matches_expected_region() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -199,7 +191,7 @@ async fn run_test() {
         },
     );
     let batch_left = make_rgba_batch(0, 0, &identity_mat, &red);
-    rd.draw_batch(&batch_left);
+    rd.draw_batch_with(&batch_left, BatchTextures::default());
     rd.end_tile(rt.handle);
 
     rd.begin_tile(
@@ -212,7 +204,7 @@ async fn run_test() {
         },
     );
     let batch_right = make_rgba_batch(48, 6, &identity_mat, &green);
-    rd.draw_batch(&batch_right);
+    rd.draw_batch_with(&batch_right, BatchTextures::default());
     rd.end_tile(rt.handle);
 
     rd.resolve_render_target(

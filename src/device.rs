@@ -1,5 +1,4 @@
-//! [`WgpuRenderDevice`], the wgpu implementation of Noesis's
-//! [`RenderDevice`].
+//! [`WgpuRenderDevice`] and [`BatchTextures`].
 //!
 //! Each `begin_*_render` opens a command encoder that the matching
 //! `end_*_render` submits. Inside the offscreen phase, draws go to the render
@@ -13,12 +12,14 @@ use std::num::NonZeroU64;
 
 use log::warn;
 
+#[cfg(feature = "shim")]
+use noesis_runtime::render_device::RenderDevice;
 use noesis_runtime::render_device::types::{
     Batch, DeviceCaps, SIZE_FOR_FORMAT, SamplerState, Shader, TextureFormat, Tile,
 };
 use noesis_runtime::render_device::{
-    RenderDevice, RenderTargetBinding, RenderTargetDesc, RenderTargetHandle, TextureBinding,
-    TextureDesc, TextureHandle, TextureRect,
+    RenderTargetBinding, RenderTargetDesc, RenderTargetHandle, TextureBinding, TextureDesc,
+    TextureHandle, TextureRect,
 };
 
 use crate::pipeline::{PipelineCache, PipelineKey, STENCIL_FORMAT};
@@ -60,20 +61,31 @@ enum FramePhase {
     Onscreen,
 }
 
-/// Noesis render device backed by wgpu.
+/// A Noesis render device that draws with wgpu.
 ///
-/// Noesis calls it with textures, render targets, and per-batch geometry, and
-/// it turns each call into wgpu work: uploads, pipelines from a
-/// a pipeline cache, and draws recorded into the active encoder.
+/// Noesis calls it with textures, render targets and per-batch geometry, and
+/// it turns each call into wgpu work: uploads, pipelines from its pipeline
+/// cache, and draws recorded into the active encoder.
 ///
-/// Create one with [`WgpuRenderDevice::new`], hand it to Noesis with
-/// [`noesis_runtime::render_device::register`], and before each frame point
-/// it at an `Rgba8Unorm` target with [`WgpuRenderDevice::set_onscreen_target`]
-/// (reach it through `Registered::device_mut`). The device is used from the
-/// thread that drives the Noesis `View` and `Renderer`.
+/// Create one with [`WgpuRenderDevice::new`], then drive it one of two ways:
 ///
-/// If a device callback panics (the FFI trampoline catches it), the next
-/// `begin_*_render` logs a warning and starts a clean phase.
+/// - Register it with `noesis_runtime`'s shim through
+///   `noesis_runtime::render_device::register` (`shim` feature). Noesis then
+///   calls the [`RenderDevice`](noesis_runtime::render_device::RenderDevice)
+///   methods itself; reach the device between frames with
+///   `Registered::device_mut`.
+/// - Call the protocol methods yourself, from a host that receives Noesis's
+///   device calls some other way. Pass each batch to
+///   [`draw_batch_with`](Self::draw_batch_with) with its textures resolved to
+///   handles.
+///
+/// Either way, point it at an `Rgba8Unorm` target with
+/// [`set_onscreen_target`](Self::set_onscreen_target) before the onscreen
+/// phase, and use it from the thread that drives the Noesis view and renderer.
+///
+/// If a call panics partway through a phase (`noesis_runtime`'s trampoline
+/// catches the panic), the next `begin_*_render` logs a warning and starts a
+/// clean phase.
 pub struct WgpuRenderDevice {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -125,11 +137,6 @@ pub struct WgpuRenderDevice {
     current_rt: Option<RenderTargetHandle>,
     current_tile: Option<Tile>,
 
-    // Test overrides set by `test_set_forced_*`; `None` when Noesis drives.
-    forced_pattern: Option<(TextureHandle, SamplerState)>,
-    forced_image: Option<(TextureHandle, SamplerState)>,
-    forced_shadow: Option<(TextureHandle, SamplerState)>,
-
     next_handle: u64,
 }
 
@@ -171,8 +178,8 @@ struct GpuRenderTarget {
 }
 
 impl WgpuRenderDevice {
-    /// Creates a device on `device` and `queue`. Call
-    /// [`Self::set_onscreen_target`] before the first onscreen render.
+    /// Creates a device that renders with `device` and submits to `queue`.
+    /// Call [`Self::set_onscreen_target`] before the first onscreen render.
     ///
     /// Every pipeline targets `Rgba8Unorm`, so onscreen views must use that
     /// format.
@@ -475,31 +482,8 @@ impl WgpuRenderDevice {
             encoder: None,
             current_rt: None,
             current_tile: None,
-            forced_pattern: None,
-            forced_image: None,
-            forced_shadow: None,
             next_handle: 1,
         }
-    }
-
-    /// Test hook: draws that read the group(2) paint texture (patterns,
-    /// gradients, glyphs, down/upsample) use `forced` instead of the batch's
-    /// texture. Lets tests without a Noesis-owned texture drive those
-    /// shaders. Pass `None` to restore normal behavior.
-    pub fn test_set_forced_pattern(&mut self, forced: Option<(TextureHandle, SamplerState)>) {
-        self.forced_pattern = forced;
-    }
-
-    /// Test hook like [`Self::test_set_forced_pattern`], for the group(3)
-    /// `image` texture.
-    pub fn test_set_forced_image(&mut self, forced: Option<(TextureHandle, SamplerState)>) {
-        self.forced_image = forced;
-    }
-
-    /// Test hook like [`Self::test_set_forced_pattern`], for the group(3)
-    /// `shadow` texture used by SHADOW and BLUR.
-    pub fn test_set_forced_shadow(&mut self, forced: Option<(TextureHandle, SamplerState)>) {
-        self.forced_shadow = forced;
     }
 
     /// Cached group(2) bind group for `(handle, state)`; `drop_texture` evicts.
@@ -606,9 +590,9 @@ impl WgpuRenderDevice {
         self.image_bind_groups.entry(key).or_insert(bg)
     }
 
-    /// Sets the view that onscreen draws render into. The plugin calls this
-    /// before each Noesis render, with the view's intermediate texture or a
-    /// bake target; a test with one fixed target can call it once.
+    /// Sets the view that onscreen draws render into. Call it before an
+    /// onscreen phase whenever the target changes, such as after a resize; a
+    /// host with one fixed target calls it once.
     ///
     /// `view` must be an `Rgba8Unorm` texture of `width` x `height` pixels
     /// (the format isn't checked). The device keeps a matching stencil buffer
@@ -934,7 +918,10 @@ const fn shader_uses_paint_texture(shader: u8) -> bool {
 /// The batch slot (pattern, ramps, or glyphs) bound at group(2) for
 /// `batch`'s shader. `None` for shaders without a paint texture, or when
 /// Noesis left the slot empty.
-fn batch_paint_texture(batch: &Batch) -> Option<(TextureHandle, SamplerState)> {
+fn batch_paint_texture(
+    batch: &Batch,
+    textures: BatchTextures,
+) -> Option<(TextureHandle, SamplerState)> {
     match batch.shader.0 {
         s if s == Shader::PATH_PATTERN.0
             || s == Shader::PATH_AA_PATTERN.0
@@ -955,7 +942,7 @@ fn batch_paint_texture(batch: &Batch) -> Option<(TextureHandle, SamplerState)> {
             || s == Shader::OPACITY_PATTERN_MIRROR_V.0
             || s == Shader::OPACITY_PATTERN_MIRROR.0 =>
         {
-            batch.pattern_handle().map(|h| (h, batch.pattern_sampler))
+            textures.pattern.map(|h| (h, batch.pattern_sampler))
         }
         s if s == Shader::PATH_LINEAR.0
             || s == Shader::PATH_AA_LINEAR.0
@@ -964,13 +951,13 @@ fn batch_paint_texture(batch: &Batch) -> Option<(TextureHandle, SamplerState)> {
             || s == Shader::OPACITY_LINEAR.0
             || s == Shader::OPACITY_RADIAL.0 =>
         {
-            batch.ramps_handle().map(|h| (h, batch.ramps_sampler))
+            textures.ramps.map(|h| (h, batch.ramps_sampler))
         }
         s if s == Shader::SDF_SOLID.0 || s == Shader::SDF_LCD_SOLID.0 => {
-            batch.glyphs_handle().map(|h| (h, batch.glyphs_sampler))
+            textures.glyphs.map(|h| (h, batch.glyphs_sampler))
         }
         s if s == Shader::DOWNSAMPLE.0 || s == Shader::UPSAMPLE.0 => {
-            batch.pattern_handle().map(|h| (h, batch.pattern_sampler))
+            textures.pattern.map(|h| (h, batch.pattern_sampler))
         }
         _ => None,
     }
@@ -1045,12 +1032,11 @@ fn build_sampler(device: &wgpu::Device, state: SamplerState) -> wgpu::Sampler {
     })
 }
 
-impl RenderDevice for WgpuRenderDevice {
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-        self
-    }
-
-    fn caps(&self) -> DeviceCaps {
+impl WgpuRenderDevice {
+    /// The capabilities Noesis queries once during setup: no linear
+    /// rendering, no subpixel text, zero-to-one depth range, and clip space
+    /// with y up.
+    pub fn caps(&self) -> DeviceCaps {
         DeviceCaps {
             center_pixel_offset: 0.0,
             linear_rendering: false,
@@ -1065,7 +1051,14 @@ impl RenderDevice for WgpuRenderDevice {
         }
     }
 
-    fn create_texture(&mut self, desc: TextureDesc<'_>) -> TextureBinding {
+    /// Creates a texture and uploads its initial mip levels, if `desc` has
+    /// any. `Rgbx8` is stored as `Rgba8Unorm` and reported without alpha.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `desc.data` holds a different number of levels than
+    /// `desc.num_levels`.
+    pub fn create_texture(&mut self, desc: TextureDesc<'_>) -> TextureBinding {
         let handle = TextureHandle(self.alloc_handle());
         let wgpu_format = wgpu_format_for(desc.format);
 
@@ -1143,7 +1136,13 @@ impl RenderDevice for WgpuRenderDevice {
         }
     }
 
-    fn update_texture(
+    /// Writes `data` into `rect` of mip `level`. `data` is tightly packed,
+    /// with no row padding.
+    ///
+    /// # Panics
+    ///
+    /// Panics on an unknown handle or a level the texture doesn't have.
+    pub fn update_texture(
         &mut self,
         handle: TextureHandle,
         level: u32,
@@ -1181,9 +1180,12 @@ impl RenderDevice for WgpuRenderDevice {
         );
     }
 
-    fn end_updating_textures(&mut self, _textures: &[TextureHandle]) {}
+    /// Ends a block of [`update_texture`](Self::update_texture) calls. A no-op:
+    /// wgpu orders the uploads before later passes on its own.
+    pub fn end_updating_textures(&mut self, _textures: &[TextureHandle]) {}
 
-    fn drop_texture(&mut self, handle: TextureHandle) {
+    /// Releases a texture and the bind groups that sample it.
+    pub fn drop_texture(&mut self, handle: TextureHandle) {
         self.textures.remove(&handle);
         self.pattern_bind_groups.retain(|(h, _), _| *h != handle);
         self.image_bind_groups.retain(|(img, _, shadow), _| {
@@ -1191,7 +1193,14 @@ impl RenderDevice for WgpuRenderDevice {
         });
     }
 
-    fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
+    /// Creates an `Rgba8Unorm` render target, with a `Stencil8` buffer when
+    /// `desc.needs_stencil` is set. Its color texture doubles as the resolve
+    /// texture Noesis samples.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `desc.sample_count` isn't 1: MSAA isn't supported.
+    pub fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
         assert_eq!(
             desc.sample_count, 1,
             "Phase 4.B only supports sample_count = 1 (use PPAA for anti-aliasing); \
@@ -1274,7 +1283,17 @@ impl RenderDevice for WgpuRenderDevice {
         }
     }
 
-    fn clone_render_target(&mut self, label: &str, src: RenderTargetHandle) -> RenderTargetBinding {
+    /// Creates a render target with the size and stencil of `src`. Noesis
+    /// allows the two to share transient buffers; this device doesn't.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `src` is unknown.
+    pub fn clone_render_target(
+        &mut self,
+        label: &str,
+        src: RenderTargetHandle,
+    ) -> RenderTargetBinding {
         // Noesis allows the clone to share src's transient buffers; a fresh RT
         // of the same size and stencil is a valid, unshared implementation.
         let (width, height, needs_stencil) = {
@@ -1293,12 +1312,15 @@ impl RenderDevice for WgpuRenderDevice {
         })
     }
 
-    fn drop_render_target(&mut self, handle: RenderTargetHandle) {
+    /// Releases a render target. Noesis releases its resolve texture
+    /// separately through [`drop_texture`](Self::drop_texture).
+    pub fn drop_render_target(&mut self, handle: RenderTargetHandle) {
         // The resolve texture is released separately through `drop_texture`.
         self.render_targets.remove(&handle);
     }
 
-    fn begin_offscreen_render(&mut self) {
+    /// Starts the offscreen phase and opens its command encoder.
+    pub fn begin_offscreen_render(&mut self) {
         // A panic caught by the FFI trampoline in an earlier callback can leave
         // the phase open. Asserting would re-trip every frame; re-sync instead
         // (replacing `encoder` drops the stale one).
@@ -1325,7 +1347,8 @@ impl RenderDevice for WgpuRenderDevice {
         self.current_tile = None;
     }
 
-    fn end_offscreen_render(&mut self) {
+    /// Ends the offscreen phase and submits its command encoder.
+    pub fn end_offscreen_render(&mut self) {
         // Warn, don't assert: see `begin_offscreen_render`.
         if self.phase != FramePhase::Offscreen {
             warn!(
@@ -1341,7 +1364,9 @@ impl RenderDevice for WgpuRenderDevice {
         self.current_tile = None;
     }
 
-    fn begin_onscreen_render(&mut self) {
+    /// Starts the onscreen phase and opens its command encoder. Draws go to
+    /// the view set by [`set_onscreen_target`](Self::set_onscreen_target).
+    pub fn begin_onscreen_render(&mut self) {
         // See `begin_offscreen_render`.
         if self.phase != FramePhase::Idle {
             warn!(
@@ -1365,7 +1390,8 @@ impl RenderDevice for WgpuRenderDevice {
         self.onscreen_stencil_cleared = false;
     }
 
-    fn end_onscreen_render(&mut self) {
+    /// Ends the onscreen phase and submits its command encoder.
+    pub fn end_onscreen_render(&mut self) {
         // See `begin_offscreen_render`.
         if self.phase != FramePhase::Onscreen {
             warn!(
@@ -1379,7 +1405,13 @@ impl RenderDevice for WgpuRenderDevice {
         self.phase = FramePhase::Idle;
     }
 
-    fn set_render_target(&mut self, handle: RenderTargetHandle) {
+    /// Makes `handle` the target of the offscreen draws that follow. Its
+    /// stencil is cleared before the next draw.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside the offscreen phase or on an unknown handle.
+    pub fn set_render_target(&mut self, handle: RenderTargetHandle) {
         assert_eq!(
             self.phase,
             FramePhase::Offscreen,
@@ -1395,7 +1427,13 @@ impl RenderDevice for WgpuRenderDevice {
         self.current_rt_stencil_cleared = false;
     }
 
-    fn begin_tile(&mut self, handle: RenderTargetHandle, tile: Tile) {
+    /// Limits the draws that follow to `tile`, given with a bottom-left
+    /// origin, until [`end_tile`](Self::end_tile).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` isn't the current render target.
+    pub fn begin_tile(&mut self, handle: RenderTargetHandle, tile: Tile) {
         assert_eq!(
             self.current_rt,
             Some(handle),
@@ -1404,7 +1442,12 @@ impl RenderDevice for WgpuRenderDevice {
         self.current_tile = Some(tile);
     }
 
-    fn end_tile(&mut self, handle: RenderTargetHandle) {
+    /// Ends the tile started by [`begin_tile`](Self::begin_tile).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `handle` isn't the current render target.
+    pub fn end_tile(&mut self, handle: RenderTargetHandle) {
         assert_eq!(
             self.current_rt,
             Some(handle),
@@ -1413,24 +1456,57 @@ impl RenderDevice for WgpuRenderDevice {
         self.current_tile = None;
     }
 
-    fn resolve_render_target(&mut self, _handle: RenderTargetHandle, _tiles: &[Tile]) {
+    /// A no-op: render targets are single-sampled, so the color texture is
+    /// already the resolve texture.
+    pub fn resolve_render_target(&mut self, _handle: RenderTargetHandle, _tiles: &[Tile]) {
         // sample_count is always 1: the color attachment is the resolve texture.
     }
 
-    fn map_vertices(&mut self, bytes: u32) -> &mut [u8] {
+    /// Returns `bytes` bytes of vertex storage for Noesis to fill. The data
+    /// reaches the GPU at [`unmap_vertices`](Self::unmap_vertices).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the previous map wasn't unmapped.
+    pub fn map_vertices(&mut self, bytes: u32) -> &mut [u8] {
         self.vertex_stream.map(bytes)
     }
-    fn unmap_vertices(&mut self) {
+    /// Uploads the vertices written since [`map_vertices`](Self::map_vertices).
+    ///
+    /// # Panics
+    ///
+    /// Panics without a preceding map.
+    pub fn unmap_vertices(&mut self) {
         self.vertex_stream.unmap(&self.device, &self.queue);
     }
-    fn map_indices(&mut self, bytes: u32) -> &mut [u8] {
+    /// Like [`map_vertices`](Self::map_vertices), for 16-bit indices.
+    pub fn map_indices(&mut self, bytes: u32) -> &mut [u8] {
         self.index_stream.map(bytes)
     }
-    fn unmap_indices(&mut self) {
+    /// Uploads the indices written since [`map_indices`](Self::map_indices).
+    ///
+    /// # Panics
+    ///
+    /// Panics without a preceding map.
+    pub fn unmap_indices(&mut self) {
         self.index_stream.unmap(&self.device, &self.queue);
     }
 
-    fn draw_batch(&mut self, batch: &Batch) {
+    /// Draws `batch`, sampling the textures in `textures`.
+    ///
+    /// The batch's own texture pointers are ignored; its samplers, uniforms,
+    /// shader and render state are used as given. A draw goes to the current
+    /// render target and tile in the offscreen phase, and to the onscreen
+    /// target in the onscreen phase. Each draw records its own render pass.
+    ///
+    /// # Panics
+    ///
+    /// Panics outside a phase, on an unknown texture, when the shader needs
+    /// a texture that `textures` leaves empty, past 1024 draws in one phase,
+    /// or for a shader that `noesis.wgsl` doesn't implement (the `SDF_*`
+    /// gradient and pattern paints, most `SDF_LCD_*` variants and custom
+    /// effects).
+    pub fn draw_batch_with(&mut self, batch: &Batch, textures: BatchTextures) {
         let (has_stencil, clear_stencil) = match self.phase {
             FramePhase::Onscreen => {
                 let has = self.onscreen_stencil.is_some();
@@ -1462,11 +1538,8 @@ impl RenderDevice for WgpuRenderDevice {
 
         // Build bind groups before borrowing `encoder` mutably.
         let pattern_slot = if shader_uses_paint_texture(batch.shader.0) {
-            let slot = self.forced_pattern.unwrap_or_else(|| {
-                batch_paint_texture(batch).expect(
-                    "paint-texture batch with null texture handle — Noesis should always populate the right slot",
-                )
-            });
+            let slot = batch_paint_texture(batch, textures)
+                .expect("paint-texture batch with an empty texture slot");
             let _ = self.pattern_bind_group_for(slot.0, slot.1);
             Some(slot)
         } else {
@@ -1474,22 +1547,16 @@ impl RenderDevice for WgpuRenderDevice {
         };
 
         let image_slot: Option<ImageBindGroupKey> = if shader_uses_image_texture(batch.shader.0) {
-            let image = self.forced_image.unwrap_or_else(|| {
-                let handle = batch.image_handle().expect(
-                    "OPACITY/UPSAMPLE/SHADOW/BLUR batch with null image handle — Noesis should populate batch.image",
-                );
-                (handle, batch.image_sampler)
+            let image = textures
+                .image
+                .map(|h| (h, batch.image_sampler))
+                .expect("OPACITY/UPSAMPLE/SHADOW/BLUR batch without an image texture");
+            let shadow = shader_uses_shadow_texture(batch.shader.0).then(|| {
+                textures
+                    .shadow
+                    .map(|h| (h, batch.shadow_sampler))
+                    .expect("SHADOW/BLUR batch without a shadow texture")
             });
-            let shadow = if shader_uses_shadow_texture(batch.shader.0) {
-                Some(self.forced_shadow.unwrap_or_else(|| {
-                    let handle = batch.shadow_handle().expect(
-                        "SHADOW/BLUR batch with null shadow handle — Noesis should populate batch.shadow",
-                    );
-                    (handle, batch.shadow_sampler)
-                }))
-            } else {
-                None
-            };
             let _ = self.image_bind_group_for(image, shadow);
             Some((image.0, image.1, shadow))
         } else {
@@ -1611,5 +1678,145 @@ impl RenderDevice for WgpuRenderDevice {
             wgpu::IndexFormat::Uint16,
         );
         rpass.draw_indexed(0..batch.num_indices, 0, 0..1);
+    }
+}
+
+/// The textures a [`Batch`] samples, as device handles.
+///
+/// Noesis hands a batch its textures as pointers to its own texture objects.
+/// [`WgpuRenderDevice::draw_batch_with`] takes handles instead, so a host that
+/// creates Noesis's textures itself (and so knows which handle each pointer
+/// stands for) can resolve them and pass them in. A field is `None` when the
+/// batch leaves that slot empty. Samplers still come from the batch.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct BatchTextures {
+    /// Pattern (brush) texture, sampled with `batch.pattern_sampler`.
+    pub pattern: Option<TextureHandle>,
+    /// Gradient ramps, sampled with `batch.ramps_sampler`.
+    pub ramps: Option<TextureHandle>,
+    /// Offscreen image or effect input, sampled with `batch.image_sampler`.
+    pub image: Option<TextureHandle>,
+    /// SDF glyph atlas, sampled with `batch.glyphs_sampler`.
+    pub glyphs: Option<TextureHandle>,
+    /// Shadow intermediate, sampled with `batch.shadow_sampler`.
+    pub shadow: Option<TextureHandle>,
+}
+
+impl BatchTextures {
+    /// Reads the handles out of `batch`'s texture pointers through
+    /// `noesis_runtime`'s shim. Only valid when every texture in the batch was
+    /// created through a device registered with
+    /// [`noesis_runtime::render_device::register`].
+    #[cfg(feature = "shim")]
+    #[must_use]
+    pub fn from_batch(batch: &Batch) -> Self {
+        Self {
+            pattern: batch.pattern_handle(),
+            ramps: batch.ramps_handle(),
+            image: batch.image_handle(),
+            glyphs: batch.glyphs_handle(),
+            shadow: batch.shadow_handle(),
+        }
+    }
+}
+
+/// Lets `noesis_runtime`'s shim drive the device: pass it to
+/// [`noesis_runtime::render_device::register`]. Each method forwards to the
+/// inherent method of the same name, and `draw_batch` reads the batch's
+/// textures with [`BatchTextures::from_batch`].
+#[cfg(feature = "shim")]
+impl RenderDevice for WgpuRenderDevice {
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn caps(&self) -> DeviceCaps {
+        Self::caps(self)
+    }
+
+    fn create_texture(&mut self, desc: TextureDesc<'_>) -> TextureBinding {
+        Self::create_texture(self, desc)
+    }
+
+    fn update_texture(
+        &mut self,
+        handle: TextureHandle,
+        level: u32,
+        rect: TextureRect,
+        data: &[u8],
+    ) {
+        Self::update_texture(self, handle, level, rect, data);
+    }
+
+    fn end_updating_textures(&mut self, textures: &[TextureHandle]) {
+        Self::end_updating_textures(self, textures);
+    }
+
+    fn drop_texture(&mut self, handle: TextureHandle) {
+        Self::drop_texture(self, handle);
+    }
+
+    fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
+        Self::create_render_target(self, desc)
+    }
+
+    fn clone_render_target(&mut self, label: &str, src: RenderTargetHandle) -> RenderTargetBinding {
+        Self::clone_render_target(self, label, src)
+    }
+
+    fn drop_render_target(&mut self, handle: RenderTargetHandle) {
+        Self::drop_render_target(self, handle);
+    }
+
+    fn begin_offscreen_render(&mut self) {
+        Self::begin_offscreen_render(self);
+    }
+
+    fn end_offscreen_render(&mut self) {
+        Self::end_offscreen_render(self);
+    }
+
+    fn begin_onscreen_render(&mut self) {
+        Self::begin_onscreen_render(self);
+    }
+
+    fn end_onscreen_render(&mut self) {
+        Self::end_onscreen_render(self);
+    }
+
+    fn set_render_target(&mut self, handle: RenderTargetHandle) {
+        Self::set_render_target(self, handle);
+    }
+
+    fn begin_tile(&mut self, handle: RenderTargetHandle, tile: Tile) {
+        Self::begin_tile(self, handle, tile);
+    }
+
+    fn end_tile(&mut self, handle: RenderTargetHandle) {
+        Self::end_tile(self, handle);
+    }
+
+    fn resolve_render_target(&mut self, handle: RenderTargetHandle, tiles: &[Tile]) {
+        Self::resolve_render_target(self, handle, tiles);
+    }
+
+    fn map_vertices(&mut self, bytes: u32) -> &mut [u8] {
+        Self::map_vertices(self, bytes)
+    }
+
+    fn unmap_vertices(&mut self) {
+        Self::unmap_vertices(self);
+    }
+
+    fn map_indices(&mut self, bytes: u32) -> &mut [u8] {
+        Self::map_indices(self, bytes)
+    }
+
+    fn unmap_indices(&mut self) {
+        Self::unmap_indices(self);
+    }
+
+    fn draw_batch(&mut self, batch: &Batch) {
+        self.draw_batch_with(batch, BatchTextures::from_batch(batch));
     }
 }

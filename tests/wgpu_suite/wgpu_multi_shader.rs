@@ -9,12 +9,11 @@
 
 use std::ffi::c_void;
 
-use noesis_runtime::render_device::RenderDevice;
 use noesis_runtime::render_device::types::Batch;
 use noesis_runtime::render_device::types::{
     BlendMode, RenderState, SamplerState, Shader, StencilMode, UniformData,
 };
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 256;
 const TARGET_H: u32 = 256;
@@ -25,15 +24,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255]; // dark blue
 
 #[test]
 fn three_shader_variants_render_into_distinct_quadrants() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -160,9 +151,9 @@ async fn run_test() {
     let path_aa_solid = make_batch(Shader::PATH_AA_SOLID, 36, 3, &identity_mat, None);
     let rgba = make_batch(Shader::RGBA, 84, 6, &identity_mat, Some(&rgba_color));
 
-    rd.draw_batch(&path_solid);
-    rd.draw_batch(&path_aa_solid);
-    rd.draw_batch(&rgba);
+    rd.draw_batch_with(&path_solid, BatchTextures::default());
+    rd.draw_batch_with(&path_aa_solid, BatchTextures::default());
+    rd.draw_batch_with(&rgba, BatchTextures::default());
 
     rd.end_onscreen_render();
 

@@ -12,12 +12,12 @@
 
 use std::ffi::c_void;
 
+use noesis_runtime::render_device::TextureDesc;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
     TextureFormat, UniformData, WrapMode,
 };
-use noesis_runtime::render_device::{RenderDevice, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 32;
 const TARGET_H: u32 = 32;
@@ -30,15 +30,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn path_pattern_clamp_and_repeat_draw_their_variants() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -131,7 +123,10 @@ async fn run_test() {
         MinMagFilter::Nearest,
         MipFilter::Disabled,
     );
-    rd.test_set_forced_pattern(Some((pattern_binding.handle, sampler_state)));
+    let textures = BatchTextures {
+        pattern: Some(pattern_binding.handle),
+        ..BatchTextures::default()
+    };
 
     // CLAMP quad (PosTex0Rect, stride 24): clip x ∈ [-1, 0], uv0 ∈ [0,1].
     //   rect=(0.25,0.25,0.75,0.75) carves a 50%×50% window; outside goes to
@@ -216,7 +211,7 @@ async fn run_test() {
         &ps_uniform0,
         sampler_state,
     );
-    rd.draw_batch(&clamp);
+    rd.draw_batch_with(&clamp, textures);
 
     let repeat = make_pattern_batch(
         Shader::PATH_PATTERN_REPEAT,
@@ -228,10 +223,9 @@ async fn run_test() {
         &ps_uniform0,
         sampler_state,
     );
-    rd.draw_batch(&repeat);
+    rd.draw_batch_with(&repeat, textures);
 
     rd.end_onscreen_render();
-    rd.test_set_forced_pattern(None);
 
     let readback = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
@@ -402,8 +396,7 @@ fn make_pattern_batch(
         num_vertices,
         start_index,
         num_indices,
-        // Never dereferenced: `test_set_forced_pattern` replaces it.
-        pattern: std::ptr::dangling_mut(),
+        pattern: std::ptr::null_mut(),
         ramps: std::ptr::null_mut(),
         image: std::ptr::null_mut(),
         glyphs: std::ptr::null_mut(),

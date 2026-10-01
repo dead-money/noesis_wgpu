@@ -11,8 +11,8 @@ use noesis_runtime::render_device::types::{
     Batch, BlendMode, MinMagFilter, MipFilter, RenderState, SamplerState, Shader, StencilMode,
     TextureFormat, UniformData, WrapMode,
 };
-use noesis_runtime::render_device::{RenderDevice, RenderTargetDesc, TextureDesc};
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_runtime::render_device::{RenderTargetDesc, TextureDesc};
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 4;
 const BYTES_PER_ROW: u32 = 256;
@@ -37,15 +37,7 @@ const GREEN_BG: wgpu::Color = wgpu::Color {
 
 #[test]
 fn sdf_lcd_subpixel_dual_source() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -151,7 +143,10 @@ async fn run_lcd_draw(
     let vb = lcd_quad(color);
     let ib = quad_indices();
 
-    rd.test_set_forced_pattern(Some((glyph, sampler)));
+    let textures = BatchTextures {
+        glyphs: Some(glyph),
+        ..BatchTextures::default()
+    };
     rd.begin_offscreen_render();
     rd.set_render_target(rt.handle);
     rd.map_vertices(vb.len() as u32).copy_from_slice(&vb);
@@ -159,11 +154,10 @@ async fn run_lcd_draw(
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
     rd.begin_tile(rt.handle, full_tile());
-    rd.draw_batch(&lcd_batch());
+    rd.draw_batch_with(&lcd_batch(sampler), textures);
     rd.end_tile(rt.handle);
     rd.resolve_render_target(rt.handle, &[]);
     rd.end_offscreen_render();
-    rd.test_set_forced_pattern(None);
 
     read_pixel(device, queue, rd, rt.resolve_texture.handle, 2, 2).await
 }
@@ -240,7 +234,7 @@ fn lcd_quad(color: [u8; 4]) -> Vec<u8> {
     vb
 }
 
-fn lcd_batch() -> Batch {
+fn lcd_batch(glyphs_sampler: SamplerState) -> Batch {
     Batch {
         shader: Shader::SDF_LCD_SOLID,
         render_state: RenderState::new(true, BlendMode::SrcOverDual, StencilMode::Disabled, false),
@@ -250,15 +244,15 @@ fn lcd_batch() -> Batch {
         num_vertices: 6,
         start_index: 0,
         num_indices: 6,
-        pattern: std::ptr::dangling_mut(),
+        pattern: std::ptr::null_mut(),
         ramps: std::ptr::null_mut(),
         image: std::ptr::null_mut(),
-        glyphs: std::ptr::dangling_mut(),
+        glyphs: std::ptr::null_mut(),
         shadow: std::ptr::null_mut(),
         pattern_sampler: SamplerState::default(),
         ramps_sampler: SamplerState::default(),
         image_sampler: SamplerState::default(),
-        glyphs_sampler: SamplerState::default(),
+        glyphs_sampler,
         shadow_sampler: SamplerState::default(),
         vertex_uniforms: [
             UniformData {

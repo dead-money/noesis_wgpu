@@ -12,11 +12,10 @@
 
 use std::ffi::c_void;
 
-use noesis_runtime::render_device::RenderDevice;
 use noesis_runtime::render_device::types::{
     Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, UniformData,
 };
-use noesis_wgpu::WgpuRenderDevice;
+use noesis_wgpu::{BatchTextures, WgpuRenderDevice};
 
 const TARGET_W: u32 = 256;
 const TARGET_H: u32 = 256;
@@ -27,15 +26,7 @@ const CLEAR: [u8; 4] = [0, 0, 64, 255];
 
 #[test]
 fn two_geometry_segments_read_distinct_streams_in_one_phase() {
-    if let (Ok(name), Ok(key)) = (
-        std::env::var("NOESIS_LICENSE_NAME"),
-        std::env::var("NOESIS_LICENSE_KEY"),
-    ) {
-        noesis_runtime::set_license(&name, &key);
-    }
-    noesis_runtime::init();
     pollster::block_on(run_test());
-    noesis_runtime::shutdown();
 }
 
 #[allow(clippy::too_many_lines)]
@@ -131,7 +122,10 @@ async fn run_test() {
     rd.unmap_vertices();
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
-    rd.draw_batch(&make_rgba_batch(0, 0, &identity_mat, &red));
+    rd.draw_batch_with(
+        &make_rgba_batch(0, 0, &identity_mat, &red),
+        BatchTextures::default(),
+    );
 
     // A clobbering stream would overwrite the left quad's bytes here.
     rd.map_vertices(right_vb.len() as u32)
@@ -139,7 +133,10 @@ async fn run_test() {
     rd.unmap_vertices();
     rd.map_indices(ib.len() as u32).copy_from_slice(&ib);
     rd.unmap_indices();
-    rd.draw_batch(&make_rgba_batch(0, 0, &identity_mat, &green));
+    rd.draw_batch_with(
+        &make_rgba_batch(0, 0, &identity_mat, &green),
+        BatchTextures::default(),
+    );
 
     rd.end_onscreen_render();
 
