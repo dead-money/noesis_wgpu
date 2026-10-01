@@ -83,9 +83,11 @@ enum FramePhase {
 /// [`set_onscreen_target`](Self::set_onscreen_target) before the onscreen
 /// phase, and use it from the thread that drives the Noesis view and renderer.
 ///
-/// If a call panics partway through a phase (`noesis_runtime`'s trampoline
-/// catches the panic), the next `begin_*_render` logs a warning and starts a
-/// clean phase.
+/// A call that breaks the protocol, such as an unknown handle or a draw
+/// outside a phase, logs a warning and is skipped instead of panicking;
+/// [`stats`](Self::stats) counts the skipped batches. If a call does panic
+/// partway through a phase (`noesis_runtime`'s trampoline catches the panic),
+/// the next `begin_*_render` logs a warning and starts a clean phase.
 pub struct WgpuRenderDevice {
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -921,9 +923,7 @@ const fn wgpu_format_for(format: TextureFormat) -> wgpu::TextureFormat {
         // No wgpu Rgbx8; `has_alpha: false` on the binding tells Noesis.
         TextureFormat::Rgba8 | TextureFormat::Rgbx8 => wgpu::TextureFormat::Rgba8Unorm,
         TextureFormat::R8 => wgpu::TextureFormat::R8Unorm,
-        // Non-exhaustive SDK enum. Raw conversions here default instead of
-        // panicking: the FFI trampoline would catch it but leave the frame
-        // half-mutated.
+        // Non-exhaustive SDK enum: default rather than panic.
         _ => wgpu::TextureFormat::Rgba8Unorm,
     }
 }
