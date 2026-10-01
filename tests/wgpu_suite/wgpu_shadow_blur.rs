@@ -9,7 +9,8 @@
 //!   BLUR:   mix(image(uv1), shadow(uv1), cb1[0]) * (opacity * paint.a).
 //!
 //! Drives `WgpuRenderDevice` directly, passing solid 1x1 textures for the
-//! two group(3) slots, sampled nearest (the default sampler state). The constants are chosen so the formulas collapse to known colors.
+//! two group(3) slots, sampled nearest (the default sampler state). The
+//! constants are chosen so the formulas collapse to known colors.
 
 use std::ffi::c_void;
 

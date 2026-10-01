@@ -1,8 +1,7 @@
 //! Drives [`WgpuRenderDevice`] directly to render a `PATH_SOLID` triangle, then
 //! asserts pixels inside are red and pixels outside keep the pre-clear color.
 //!
-//! Noesis is only initialized and shut down; the `Batch` is hand-built, so the
-//! render device is tested without Noesis doing any rendering work.
+//! The `Batch` is hand-built, so the render device is tested without Noesis.
 
 use std::ffi::c_void;
 
