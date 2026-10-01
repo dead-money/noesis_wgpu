@@ -42,8 +42,7 @@ fn sdf_lcd_subpixel_dual_source() {
 
 #[allow(clippy::too_many_lines)]
 async fn run_test() {
-    let instance =
-        wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
+    let instance = crate::instance();
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::HighPerformance,
