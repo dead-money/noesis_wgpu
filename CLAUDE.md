@@ -13,6 +13,9 @@ Noesis hands a `RenderDevice`, on a wgpu device and queue the caller owns.
   `noesis_runtime`'s C++ shim. Keep everything else building and tested with
   `--no-default-features`, and never call `Batch::*_handle()` outside
   shim-gated code: it reads garbage from a texture the shim didn't create.
+- **No panics on the protocol path.** Hosts build with `panic = "abort"`. A bad
+  call from Noesis or the host logs a warning (once per cause in the draw
+  path) and is skipped.
 - **SDK never in the repo.** It lives at `$NOESIS_SDK_DIR` (per-developer
   licensed); never commit any SDK content.
 - **Release lines follow wgpu majors.** `main` is on the newest wgpu;

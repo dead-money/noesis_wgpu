@@ -7,16 +7,12 @@ use std::collections::HashSet;
 
 use noesis_runtime::render_device::types::Shader;
 
-/// Returns the WGSL define set for `shader`.
-///
-/// # Panics
-///
-/// Panics if `shader` has no `noesis.wgsl` variant: the `SDF_*` gradient and
-/// pattern paints, every `SDF_LCD_*` except `SDF_LCD_SOLID`, and
-/// `CUSTOM_EFFECT`.
+/// Returns the WGSL define set for `shader`, or `None` when `noesis.wgsl` has
+/// no variant for it: the `SDF_*` gradient and pattern paints, every
+/// `SDF_LCD_*` except `SDF_LCD_SOLID`, and `CUSTOM_EFFECT`.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one arm per shader variant, no abstraction buys clarity here
-pub fn defines_for_shader(shader: Shader) -> HashSet<&'static str> {
+pub fn defines_for_shader(shader: Shader) -> Option<HashSet<&'static str>> {
     let mut d: HashSet<&'static str> = HashSet::new();
     match shader.0 {
         n if n == Shader::RGBA.0 => {
@@ -330,12 +326,7 @@ pub fn defines_for_shader(shader: Shader) -> HashSet<&'static str> {
             d.insert("EFFECT_BLUR");
         }
 
-        other => panic!(
-            "Shader({other}) not yet ported to noesis.wgsl. \
-             CUSTOM_EFFECT (52) needs user pixel-shader compilation via \
-             Batch.pixelShader. Extend \
-             shader_defines::defines_for_shader and noesis.wgsl together."
-        ),
+        _ => return None,
     }
-    d
+    Some(d)
 }

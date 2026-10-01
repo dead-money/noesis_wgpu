@@ -92,6 +92,7 @@ device.draw_batch_with(batch, textures);
 - **One encoder per phase.** `begin_offscreen_render` and `begin_onscreen_render` each open a command encoder, and the matching `end_*` submits it. Every draw records its own render pass.
 - **Per-draw uniforms.** All of a phase's buffer writes land before its encoder is submitted, so each draw writes its uniforms to its own slot of a ring buffer, which doubles when a phase fills it, and geometry is appended rather than overwritten.
 - **Stencil clipping.** Render targets that ask for one, and the onscreen target, get a `Stencil8` buffer, cleared before the first draw into each target.
+- **No panics on a bad call.** A call that breaks the protocol, such as an unknown handle or a draw outside a phase, logs a warning and is skipped, as is a batch whose shader the device doesn't implement. Hosts that build with `panic = "abort"` keep running.
 - **No extra wgpu features.** Text uses Noesis's grayscale SDF path. Subpixel (LCD) text, which needs dual-source blending, is off.
 
 What it doesn't do yet: MSAA render targets (Noesis's offscreen sample count must stay 1), custom pixel shaders (`ShaderEffect` and `BrushShader` batches), and the `SDF_*` gradient and pattern paints.

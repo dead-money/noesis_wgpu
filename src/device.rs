@@ -7,7 +7,7 @@
 //! uniforms and geometry are appended to per-phase buffers, so every draw
 //! recorded in a phase reads its own data when the encoder is submitted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 
 use log::warn;
@@ -114,6 +114,8 @@ pub struct WgpuRenderDevice {
     dummy_sampler: wgpu::Sampler,
 
     pipelines: PipelineCache,
+    // Shaders already reported as unsupported.
+    warned_shaders: HashSet<u8>,
 
     // Entries removed by `drop_texture` / `drop_render_target`.
     textures: HashMap<TextureHandle, GpuTexture>,
@@ -133,6 +135,15 @@ pub struct WgpuRenderDevice {
     current_tile: Option<Tile>,
 
     next_handle: u64,
+}
+
+/// Why [`WgpuRenderDevice::draw_batch_with`] skipped a batch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum SkippedDraw {
+    /// The call broke the render-device protocol or named an unknown handle.
+    Protocol,
+    /// The batch's shader has no `noesis.wgsl` variant.
+    UnsupportedShader,
 }
 
 /// `(image, image sampler, shadow)`; a `None` shadow binds the dummy texture.
@@ -361,6 +372,7 @@ impl WgpuRenderDevice {
             dummy_view,
             dummy_sampler,
             pipelines,
+            warned_shaders: HashSet::new(),
             textures: HashMap::new(),
             render_targets: HashMap::new(),
             target_view: None,
@@ -375,23 +387,15 @@ impl WgpuRenderDevice {
         }
     }
 
-    /// Cached group(2) bind group for `(handle, state)`; `drop_texture` evicts.
-    fn pattern_bind_group_for(
-        &mut self,
-        handle: TextureHandle,
-        state: SamplerState,
-    ) -> &wgpu::BindGroup {
+    /// Caches the group(2) bind group for `(handle, state)`; `drop_texture`
+    /// evicts it. `false` for an unknown handle.
+    fn ensure_pattern_bind_group(&mut self, handle: TextureHandle, state: SamplerState) -> bool {
         if self.pattern_bind_groups.contains_key(&(handle, state)) {
-            return self
-                .pattern_bind_groups
-                .get(&(handle, state))
-                .expect("just checked contains_key");
+            return true;
         }
-        let view = self
-            .textures
-            .get(&handle)
-            .map(|t| &t.view)
-            .expect("pattern_bind_group_for: unknown TextureHandle");
+        let Some(view) = self.textures.get(&handle).map(|t| &t.view) else {
+            return false;
+        };
         let sampler = self
             .samplers
             .entry(state)
@@ -410,24 +414,18 @@ impl WgpuRenderDevice {
                 },
             ],
         });
-        self.pattern_bind_groups
-            .entry((handle, state))
-            .or_insert(bg)
+        self.pattern_bind_groups.insert((handle, state), bg);
+        true
     }
 
-    /// Cached group(3) bind group; a `None` shadow binds the dummy at 2/3.
-    fn image_bind_group_for(
-        &mut self,
-        image: (TextureHandle, SamplerState),
-        shadow: Option<(TextureHandle, SamplerState)>,
-    ) -> &wgpu::BindGroup {
-        let key: ImageBindGroupKey = (image.0, image.1, shadow);
+    /// Caches the group(3) bind group for `key`; a `None` shadow binds the
+    /// dummy at 2/3. `false` for an unknown handle.
+    fn ensure_image_bind_group(&mut self, key: ImageBindGroupKey) -> bool {
+        let (image_handle, image_state, shadow) = key;
         if self.image_bind_groups.contains_key(&key) {
-            return self
-                .image_bind_groups
-                .get(&key)
-                .expect("just checked contains_key");
+            return true;
         }
+        let image = (image_handle, image_state);
         self.samplers
             .entry(image.1)
             .or_insert_with(|| build_sampler(&self.device, image.1));
@@ -437,19 +435,15 @@ impl WgpuRenderDevice {
                 .or_insert_with(|| build_sampler(&self.device, sstate));
         }
 
-        let image_view = self
-            .textures
-            .get(&image.0)
-            .map(|t| &t.view)
-            .expect("image_bind_group_for: unknown image TextureHandle");
+        let Some(image_view) = self.textures.get(&image.0).map(|t| &t.view) else {
+            return false;
+        };
         let image_sampler = &self.samplers[&image.1];
         let (shadow_view, shadow_sampler) = match shadow {
             Some((handle, sstate)) => {
-                let view = self
-                    .textures
-                    .get(&handle)
-                    .map(|t| &t.view)
-                    .expect("image_bind_group_for: unknown shadow TextureHandle");
+                let Some(view) = self.textures.get(&handle).map(|t| &t.view) else {
+                    return false;
+                };
                 (view, &self.samplers[&sstate])
             }
             None => (&self.dummy_view, &self.dummy_sampler),
@@ -476,7 +470,8 @@ impl WgpuRenderDevice {
                 },
             ],
         });
-        self.image_bind_groups.entry(key).or_insert(bg)
+        self.image_bind_groups.insert(key, bg);
+        true
     }
 
     /// Sets the view that onscreen draws render into. Call it before an
@@ -487,16 +482,16 @@ impl WgpuRenderDevice {
     /// (the format isn't checked). The device keeps a matching stencil buffer
     /// for onscreen clipping and reallocates it only when the size changes.
     ///
-    /// # Panics
-    ///
-    /// Panics if a frame phase is open; call it between `end_*_render` and
-    /// the next `begin_*_render`.
+    /// Call it between `end_*_render` and the next `begin_*_render`. Called
+    /// inside a phase, it logs a warning and the draws that follow use the new
+    /// target.
     pub fn set_onscreen_target(&mut self, view: wgpu::TextureView, width: u32, height: u32) {
-        assert_eq!(
-            self.phase,
-            FramePhase::Idle,
-            "set_onscreen_target called while a frame phase is active",
-        );
+        if self.phase != FramePhase::Idle {
+            warn!(
+                "set_onscreen_target called inside the {:?} phase",
+                self.phase
+            );
+        }
         let need_alloc = self
             .onscreen_stencil
             .as_ref()
@@ -523,6 +518,7 @@ impl WgpuRenderDevice {
                 width,
                 height,
             });
+            self.onscreen_stencil_cleared = false;
         }
         self.target_view = Some(view);
     }
@@ -865,7 +861,12 @@ impl GeometryStream {
     }
 
     fn map(&mut self, bytes: u32) -> &mut [u8] {
-        assert!(self.mapped_bytes.is_none(), "map without unmap");
+        if self.mapped_bytes.is_some() {
+            warn!(
+                "{}: map without unmap; the earlier map is discarded",
+                self.label
+            );
+        }
         let len = bytes as usize;
         if len > self.staging.len() {
             self.staging.resize(len, 0);
@@ -875,7 +876,10 @@ impl GeometryStream {
     }
 
     fn unmap(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        let bytes = self.mapped_bytes.take().expect("unmap without map");
+        let Some(bytes) = self.mapped_bytes.take() else {
+            warn!("{}: unmap without map", self.label);
+            return;
+        };
         let padded = round_up_to_4(bytes as usize) as u64;
         // No copy on growth: earlier draws hold the old buffer through the
         // encoder and never read past their own segment.
@@ -1090,11 +1094,7 @@ impl WgpuRenderDevice {
 
     /// Creates a texture and uploads its initial mip levels, if `desc` has
     /// any. `Rgbx8` is stored as `Rgba8Unorm` and reported without alpha.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `desc.data` holds a different number of levels than
-    /// `desc.num_levels`.
+    /// Extra data levels are ignored, with a warning.
     pub fn create_texture(&mut self, desc: TextureDesc<'_>) -> TextureBinding {
         let handle = TextureHandle(self.alloc_handle());
         let wgpu_format = wgpu_format_for(desc.format);
@@ -1115,15 +1115,16 @@ impl WgpuRenderDevice {
         });
 
         if let Some(levels) = desc.data {
-            assert_eq!(
-                levels.len() as u32,
-                desc.num_levels,
-                "create_texture: data.len() ({}) must equal num_levels ({})",
-                levels.len(),
-                desc.num_levels,
-            );
+            if levels.len() != desc.num_levels as usize {
+                warn!(
+                    "create_texture '{}': {} data levels for {} mip levels",
+                    desc.label,
+                    levels.len(),
+                    desc.num_levels,
+                );
+            }
             let bpp = bytes_per_pixel(desc.format);
-            for (level, bytes) in levels.iter().enumerate() {
+            for (level, bytes) in levels.iter().take(desc.num_levels as usize).enumerate() {
                 let level_u32 = level as u32;
                 let w = (desc.width >> level_u32).max(1);
                 let h = (desc.height >> level_u32).max(1);
@@ -1175,10 +1176,8 @@ impl WgpuRenderDevice {
 
     /// Writes `data` into `rect` of mip `level`. `data` is tightly packed,
     /// with no row padding.
-    ///
-    /// # Panics
-    ///
-    /// Panics on an unknown handle or a level the texture doesn't have.
+    /// An unknown handle or a level the texture doesn't have logs a warning
+    /// and writes nothing.
     pub fn update_texture(
         &mut self,
         handle: TextureHandle,
@@ -1186,12 +1185,18 @@ impl WgpuRenderDevice {
         rect: TextureRect,
         data: &[u8],
     ) {
-        let tex = self
-            .textures
-            .get(&handle)
-            .expect("update_texture: unknown TextureHandle");
+        let Some(tex) = self.textures.get(&handle) else {
+            warn!("update_texture: unknown texture {handle:?}");
+            return;
+        };
+        if level >= tex.num_levels {
+            warn!(
+                "update_texture: level {level} of a texture with {} levels",
+                tex.num_levels
+            );
+            return;
+        }
         let bpp = bytes_per_pixel(tex.noesis_format);
-        assert!(level < tex.num_levels, "update_texture level out of range");
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex.texture,
@@ -1234,14 +1239,16 @@ impl WgpuRenderDevice {
     /// `desc.needs_stencil` is set. Its color texture doubles as the resolve
     /// texture Noesis samples.
     ///
-    /// # Panics
-    ///
-    /// Panics if `desc.sample_count` isn't 1: MSAA isn't supported.
+    /// MSAA isn't supported: any `desc.sample_count` gets a single-sampled
+    /// target, with a one-time warning.
     pub fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
-        assert_eq!(
-            desc.sample_count, 1,
-            "create_render_target: MSAA is unsupported, sample_count must be 1",
-        );
+        if desc.sample_count != 1 {
+            warn_once!(
+                "create_render_target: MSAA is unsupported; creating single-sampled targets \
+                 instead of {} samples",
+                desc.sample_count,
+            );
+        }
 
         let rt_handle = RenderTargetHandle(self.alloc_handle());
         let resolve_handle = TextureHandle(self.alloc_handle());
@@ -1321,10 +1328,7 @@ impl WgpuRenderDevice {
 
     /// Creates a render target with the size and stencil of `src`. Noesis
     /// allows the two to share transient buffers; this device doesn't.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `src` is unknown.
+    /// An unknown `src` logs a warning and gets a 1x1 target.
     pub fn clone_render_target(
         &mut self,
         label: &str,
@@ -1332,12 +1336,14 @@ impl WgpuRenderDevice {
     ) -> RenderTargetBinding {
         // Noesis allows the clone to share src's transient buffers; a fresh RT
         // of the same size and stencil is a valid, unshared implementation.
-        let (width, height, needs_stencil) = {
-            let src_rt = self
-                .render_targets
-                .get(&src)
-                .expect("clone_render_target: unknown src RenderTargetHandle");
-            (src_rt.width, src_rt.height, src_rt.stencil.is_some())
+        let (width, height, needs_stencil) = match self.render_targets.get(&src) {
+            Some(src_rt) => (src_rt.width, src_rt.height, src_rt.stencil.is_some()),
+            None => {
+                warn!(
+                    "clone_render_target '{label}': unknown source {src:?}; creating a 1x1 target"
+                );
+                (1, 1, false)
+            }
         };
         self.create_render_target(RenderTargetDesc {
             label,
@@ -1439,21 +1445,20 @@ impl WgpuRenderDevice {
 
     /// Makes `handle` the target of the offscreen draws that follow. Its
     /// stencil is cleared before the next draw.
-    ///
-    /// # Panics
-    ///
-    /// Panics outside the offscreen phase or on an unknown handle.
+    /// An unknown handle logs a warning, and offscreen draws skip until the
+    /// next call.
     pub fn set_render_target(&mut self, handle: RenderTargetHandle) {
-        assert_eq!(
-            self.phase,
-            FramePhase::Offscreen,
-            "set_render_target outside offscreen phase",
-        );
-        assert!(
-            self.render_targets.contains_key(&handle),
-            "set_render_target: unknown RenderTargetHandle",
-        );
-        self.current_rt = Some(handle);
+        if self.phase != FramePhase::Offscreen {
+            warn!("set_render_target called in the {:?} phase", self.phase);
+        }
+        if self.render_targets.contains_key(&handle) {
+            self.current_rt = Some(handle);
+        } else {
+            warn!(
+                "set_render_target: unknown render target {handle:?}; draws skip until the next one"
+            );
+            self.current_rt = None;
+        }
         self.current_tile = None;
         // The protocol discards the RT's contents here, so re-clear its stencil.
         self.current_rt_stencil_cleared = false;
@@ -1461,30 +1466,18 @@ impl WgpuRenderDevice {
 
     /// Limits the draws that follow to `tile`, given with a bottom-left
     /// origin, until [`end_tile`](Self::end_tile).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `handle` isn't the current render target.
     pub fn begin_tile(&mut self, handle: RenderTargetHandle, tile: Tile) {
-        assert_eq!(
-            self.current_rt,
-            Some(handle),
-            "begin_tile for a handle that isn't the currently-bound RT",
-        );
+        if self.current_rt != Some(handle) {
+            warn!("begin_tile for {handle:?}, which isn't the current render target");
+        }
         self.current_tile = Some(tile);
     }
 
     /// Ends the tile started by [`begin_tile`](Self::begin_tile).
-    ///
-    /// # Panics
-    ///
-    /// Panics if `handle` isn't the current render target.
     pub fn end_tile(&mut self, handle: RenderTargetHandle) {
-        assert_eq!(
-            self.current_rt,
-            Some(handle),
-            "end_tile for a handle that isn't the currently-bound RT",
-        );
+        if self.current_rt != Some(handle) {
+            warn!("end_tile for {handle:?}, which isn't the current render target");
+        }
         self.current_tile = None;
     }
 
@@ -1496,18 +1489,10 @@ impl WgpuRenderDevice {
 
     /// Returns `bytes` bytes of vertex storage for Noesis to fill. The data
     /// reaches the GPU at [`unmap_vertices`](Self::unmap_vertices).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the previous map wasn't unmapped.
     pub fn map_vertices(&mut self, bytes: u32) -> &mut [u8] {
         self.vertex_stream.map(bytes)
     }
     /// Uploads the vertices written since [`map_vertices`](Self::map_vertices).
-    ///
-    /// # Panics
-    ///
-    /// Panics without a preceding map.
     pub fn unmap_vertices(&mut self) {
         self.vertex_stream.unmap(&self.device, &self.queue);
     }
@@ -1516,10 +1501,6 @@ impl WgpuRenderDevice {
         self.index_stream.map(bytes)
     }
     /// Uploads the indices written since [`map_indices`](Self::map_indices).
-    ///
-    /// # Panics
-    ///
-    /// Panics without a preceding map.
     pub fn unmap_indices(&mut self) {
         self.index_stream.unmap(&self.device, &self.queue);
     }
@@ -1531,66 +1512,85 @@ impl WgpuRenderDevice {
     /// render target and tile in the offscreen phase, and to the onscreen
     /// target in the onscreen phase. Each draw records its own render pass.
     ///
-    /// # Panics
-    ///
-    /// Panics outside a phase, on an unknown texture, when the shader needs
-    /// a texture that `textures` leaves empty, past 1024 draws in one phase,
-    /// or for a shader that `noesis.wgsl` doesn't implement (the `SDF_*`
-    /// gradient and pattern paints, most `SDF_LCD_*` variants and custom
-    /// effects).
+    /// A batch that can't be drawn is skipped with a warning (logged once per
+    /// cause) rather than a panic: one outside a phase or without a target,
+    /// one whose shader needs a texture that `textures` leaves empty or names
+    /// an unknown handle, one whose geometry runs past the mapped buffers, and
+    /// one whose shader this device doesn't implement (custom effects, the
+    /// `SDF_*` gradient and pattern paints, and most `SDF_LCD_*` variants).
     pub fn draw_batch_with(&mut self, batch: &Batch, textures: BatchTextures) {
+        let _ = self.record_draw(batch, textures);
+    }
+
+    #[allow(clippy::too_many_lines)] // one pass of checks, then one render pass
+    fn record_draw(&mut self, batch: &Batch, textures: BatchTextures) -> Result<(), SkippedDraw> {
         let (has_stencil, clear_stencil) = match self.phase {
             FramePhase::Onscreen => {
+                if self.target_view.is_none() {
+                    warn_once!("onscreen draw without set_onscreen_target; skipping");
+                    return Err(SkippedDraw::Protocol);
+                }
                 let has = self.onscreen_stencil.is_some();
-                let clear = has && !self.onscreen_stencil_cleared;
-                self.onscreen_stencil_cleared = true;
-                (has, clear)
+                (has, has && !self.onscreen_stencil_cleared)
             }
             FramePhase::Offscreen => {
-                let rt_handle = self
-                    .current_rt
-                    .expect("draw_batch during offscreen phase without set_render_target");
-                let has = self
-                    .render_targets
-                    .get(&rt_handle)
-                    .expect("current_rt dangles")
-                    .stencil
-                    .is_some();
-                let clear = has && !self.current_rt_stencil_cleared;
-                self.current_rt_stencil_cleared = true;
-                (has, clear)
+                let Some(rt) = self.current_rt.and_then(|h| self.render_targets.get(&h)) else {
+                    warn_once!("offscreen draw without a live render target; skipping");
+                    return Err(SkippedDraw::Protocol);
+                };
+                let has = rt.stencil.is_some();
+                (has, has && !self.current_rt_stencil_cleared)
             }
-            FramePhase::Idle => panic!("draw_batch outside begin/end_*_render"),
+            FramePhase::Idle => {
+                warn_once!("draw outside begin/end_*_render; skipping");
+                return Err(SkippedDraw::Protocol);
+            }
         };
 
-        let key = PipelineKey::from_batch(batch, has_stencil);
-
-        let (vs_offset, ps_offset, ps1_offset) = self.upload_uniforms(batch);
-        self.pipelines.ensure(key);
+        let Some(key) = PipelineKey::from_batch(batch, has_stencil) else {
+            self.warn_unsupported_shader(batch.shader.0);
+            return Err(SkippedDraw::UnsupportedShader);
+        };
+        if !self.pipelines.ensure(key) {
+            self.warn_unsupported_shader(batch.shader.0);
+            return Err(SkippedDraw::UnsupportedShader);
+        }
 
         // Build bind groups before borrowing `encoder` mutably.
         let pattern_slot = if shader_uses_paint_texture(batch.shader.0) {
-            let slot = batch_paint_texture(batch, textures)
-                .expect("paint-texture batch with an empty texture slot");
-            let _ = self.pattern_bind_group_for(slot.0, slot.1);
+            let Some(slot) = batch_paint_texture(batch, textures) else {
+                warn_once!("batch's shader samples a paint texture it wasn't given; skipping");
+                return Err(SkippedDraw::Protocol);
+            };
+            if !self.ensure_pattern_bind_group(slot.0, slot.1) {
+                warn_once!("batch names an unknown paint texture; skipping");
+                return Err(SkippedDraw::Protocol);
+            }
             Some(slot)
         } else {
             None
         };
 
         let image_slot: Option<ImageBindGroupKey> = if shader_uses_image_texture(batch.shader.0) {
-            let image = textures
-                .image
-                .map(|h| (h, batch.image_sampler))
-                .expect("OPACITY/UPSAMPLE/SHADOW/BLUR batch without an image texture");
-            let shadow = shader_uses_shadow_texture(batch.shader.0).then(|| {
-                textures
-                    .shadow
-                    .map(|h| (h, batch.shadow_sampler))
-                    .expect("SHADOW/BLUR batch without a shadow texture")
-            });
-            let _ = self.image_bind_group_for(image, shadow);
-            Some((image.0, image.1, shadow))
+            let Some(image) = textures.image else {
+                warn_once!("batch's shader samples an image texture it wasn't given; skipping");
+                return Err(SkippedDraw::Protocol);
+            };
+            let shadow = if shader_uses_shadow_texture(batch.shader.0) {
+                let Some(shadow) = textures.shadow else {
+                    warn_once!("batch's shader samples a shadow texture it wasn't given; skipping");
+                    return Err(SkippedDraw::Protocol);
+                };
+                Some((shadow, batch.shadow_sampler))
+            } else {
+                None
+            };
+            let key = (image, batch.image_sampler, shadow);
+            if !self.ensure_image_bind_group(key) {
+                warn_once!("batch names an unknown image or shadow texture; skipping");
+                return Err(SkippedDraw::Protocol);
+            }
+            Some(key)
         } else {
             None
         };
@@ -1601,63 +1601,53 @@ impl WgpuRenderDevice {
         let vertex_byte_count = u64::from(batch.num_vertices) * stride;
         let index_byte_offset = self.index_stream.segment_base() + u64::from(batch.start_index) * 2;
         let index_byte_count = u64::from(batch.num_indices) * 2;
+        if vertex_offset + vertex_byte_count > self.vertex_stream.buffer().size()
+            || index_byte_offset + index_byte_count > self.index_stream.buffer().size()
+        {
+            warn_once!("batch geometry runs past the mapped buffers; skipping");
+            return Err(SkippedDraw::Protocol);
+        }
 
-        let (target_view, scissor, stencil_view) = match self.phase {
-            FramePhase::Onscreen => {
-                let view = self
-                    .target_view
-                    .as_ref()
-                    .expect("onscreen draw without set_onscreen_target");
-                let stencil = self.onscreen_stencil.as_ref().map(|s| &s.view);
-                (view, None, stencil)
-            }
-            FramePhase::Offscreen => {
-                let rt_handle = self
-                    .current_rt
-                    .expect("draw_batch during offscreen phase without set_render_target");
-                let rt = self
-                    .render_targets
-                    .get(&rt_handle)
-                    .expect("current_rt dangles");
-                // Noesis tiles are bottom-left origin; wgpu scissors top-left.
-                let scissor = self.current_tile.map(|t| {
-                    let y_top = rt.height.saturating_sub(t.y + t.height);
-                    (t.x, y_top, t.width, t.height)
-                });
-                let stencil = rt.stencil.as_ref().map(|(_, view)| view);
-                (&rt.color_view, scissor, stencil)
-            }
-            FramePhase::Idle => panic!("draw_batch outside begin/end_*_render"),
+        let (vs_offset, ps_offset, ps1_offset) = self.upload_uniforms(batch);
+
+        let (target_view, scissor, stencil_view) = if self.phase == FramePhase::Offscreen {
+            let Some(rt) = self.current_rt.and_then(|h| self.render_targets.get(&h)) else {
+                return Err(SkippedDraw::Protocol);
+            };
+            self.current_rt_stencil_cleared = true;
+            // Noesis tiles are bottom-left origin; wgpu scissors top-left.
+            let scissor = self.current_tile.map(|t| {
+                let y_top = rt.height.saturating_sub(t.y + t.height);
+                (t.x, y_top, t.width, t.height)
+            });
+            let stencil = rt.stencil.as_ref().map(|(_, view)| view);
+            (&rt.color_view, scissor, stencil)
+        } else {
+            self.onscreen_stencil_cleared = true;
+            let Some(view) = self.target_view.as_ref() else {
+                return Err(SkippedDraw::Protocol);
+            };
+            let stencil = self.onscreen_stencil.as_ref().map(|s| &s.view);
+            (view, None, stencil)
         };
-        debug_assert_eq!(
-            has_stencil,
-            stencil_view.is_some(),
-            "has_stencil must agree with the resolved stencil view",
-        );
 
         let pipeline = self.pipelines.get(key);
         let vertex_buffer = self.vertex_stream.buffer();
         let index_buffer = self.index_stream.buffer();
         let vs_bg = &self.uniforms.vs_bind_group;
         let ps_bg = &self.uniforms.ps_bind_group;
-        let pattern_bg = if let Some(slot) = pattern_slot {
-            self.pattern_bind_groups
-                .get(&slot)
-                .expect("pattern bind group not cached")
-        } else {
-            &self.dummy_pattern_bg
+        let pattern_bg = match pattern_slot {
+            Some(slot) => &self.pattern_bind_groups[&slot],
+            None => &self.dummy_pattern_bg,
         };
-        let image_bg = if let Some(slot) = image_slot {
-            self.image_bind_groups
-                .get(&slot)
-                .expect("image bind group not cached")
-        } else {
-            &self.dummy_image_bg
+        let image_bg = match image_slot {
+            Some(slot) => &self.image_bind_groups[&slot],
+            None => &self.dummy_image_bg,
         };
-        let encoder = self
-            .encoder
-            .as_mut()
-            .expect("draw_batch outside begin/end_*_render");
+        let Some(encoder) = self.encoder.as_mut() else {
+            warn_once!("draw with no open command encoder; skipping");
+            return Err(SkippedDraw::Protocol);
+        };
 
         // Later draws load the stencil so the clip stack accumulates.
         let depth_stencil_attachment =
@@ -1710,6 +1700,14 @@ impl WgpuRenderDevice {
             wgpu::IndexFormat::Uint16,
         );
         rpass.draw_indexed(0..batch.num_indices, 0, 0..1);
+        Ok(())
+    }
+
+    /// Warns once per shader that this device can't draw it.
+    fn warn_unsupported_shader(&mut self, shader: u8) {
+        if self.warned_shaders.insert(shader) {
+            warn!("Noesis shader {shader} isn't implemented; skipping its batches");
+        }
     }
 }
 

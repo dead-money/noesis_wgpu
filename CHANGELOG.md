@@ -9,6 +9,12 @@ pre-1.0, any `0.x` release may contain breaking changes.
 ### Changed
 
 - **Breaking:** moved to wgpu 30. The 0.1 line stays on wgpu 29 for Bevy 0.19.
+- Protocol violations no longer panic. An unknown handle, a draw outside a
+  phase or without a target, a missing batch texture, geometry past the mapped
+  buffers, a mismatched tile, or an unbalanced map logs a warning and skips
+  the call or the draw. A batch whose shader the device doesn't implement is
+  skipped with one warning per shader, and an MSAA render target is created
+  single-sampled.
 
 ### Fixed
 

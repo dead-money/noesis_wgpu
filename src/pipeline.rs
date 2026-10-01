@@ -5,10 +5,10 @@
 //! because blend mode, stencil mode, color writes, and stencil-attachment
 //! presence are all part of the key.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use noesis_runtime::render_device::types::{
-    Batch, FORMAT_FOR_VERTEX, RenderState, VERTEX_FOR_SHADER,
+    Batch, FORMAT_FOR_VERTEX, RenderState, Shader, VERTEX_FOR_SHADER,
 };
 
 use crate::shader_defines::defines_for_shader;
@@ -37,21 +37,18 @@ pub struct PipelineKey {
 
 impl PipelineKey {
     /// Key for drawing `batch` into a pass that does (`has_stencil`) or
-    /// doesn't have a stencil attachment.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `batch.shader` is out of range for the SDK lookup tables.
+    /// doesn't have a stencil attachment. `None` when `batch.shader` is out of
+    /// range for the SDK lookup tables.
     #[must_use]
-    pub fn from_batch(batch: &Batch, has_stencil: bool) -> Self {
-        let vshader = VERTEX_FOR_SHADER[batch.shader.0 as usize];
+    pub fn from_batch(batch: &Batch, has_stencil: bool) -> Option<Self> {
+        let vshader = *VERTEX_FOR_SHADER.get(usize::from(batch.shader.0))?;
         let vfmt = FORMAT_FOR_VERTEX[vshader as usize];
-        Self {
+        Some(Self {
             shader: batch.shader.0,
             render_state: batch.render_state.0,
             vertex_format: vfmt,
             has_stencil,
-        }
+        })
     }
 }
 
@@ -167,19 +164,28 @@ impl PipelineCache {
         }
     }
 
-    /// Builds the pipeline for `key` if it isn't cached yet. Fetch it with
-    /// [`Self::get`]; the split lets the caller hold other borrows between the
-    /// two calls.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `key.shader` has no WGSL variant (see [`defines_for_shader`]).
-    /// A variant that fails WGSL validation is reported through the wgpu
+    /// Builds the pipeline for `key` if it isn't cached yet, and returns
+    /// `false` when `key.shader` has no WGSL variant (see
+    /// [`defines_for_shader`]). Fetch the pipeline with [`Self::get`]; the
+    /// split lets the caller hold other borrows between the two calls. A
+    /// variant that fails WGSL validation is reported through the wgpu
     /// device's error handler.
-    pub fn ensure(&mut self, key: PipelineKey) {
-        self.cache.entry(key).or_insert_with(|| {
-            build_pipeline(&self.device, &self.pipeline_layout, self.target_format, key)
-        });
+    pub fn ensure(&mut self, key: PipelineKey) -> bool {
+        if self.cache.contains_key(&key) {
+            return true;
+        }
+        let Some(defines) = defines_for_shader(Shader(key.shader)) else {
+            return false;
+        };
+        let pipeline = build_pipeline(
+            &self.device,
+            &self.pipeline_layout,
+            self.target_format,
+            key,
+            &defines,
+        );
+        self.cache.insert(key, pipeline);
+        true
     }
 
     /// Returns the pipeline built by [`Self::ensure`] for `key`.
@@ -249,9 +255,9 @@ fn build_pipeline(
     layout: &wgpu::PipelineLayout,
     target_format: wgpu::TextureFormat,
     key: PipelineKey,
+    defines: &HashSet<&'static str>,
 ) -> wgpu::RenderPipeline {
-    let defines = defines_for_shader(noesis_runtime::render_device::types::Shader(key.shader));
-    let source = preprocess(NOESIS_WGSL, &defines);
+    let source = preprocess(NOESIS_WGSL, defines);
 
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some(&format!("noesis_wgpu Shader({})", key.shader)),
