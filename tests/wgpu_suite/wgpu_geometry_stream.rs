@@ -9,6 +9,9 @@
 //! 256x256 target; the left half is drawn red and the right half green, each
 //! quad from its own map/unmap cycle. If the streams are clobbered, both draws
 //! render the right quad and the left half stays at the clear color.
+//!
+//! A last segment outgrows the initial index buffer with a length that isn't a
+//! multiple of 4, which `unmap` pads.
 
 use std::ffi::c_void;
 
@@ -137,6 +140,11 @@ async fn run_test() {
         &make_rgba_batch(0, 0, &identity_mat, &green),
         BatchTextures::default(),
     );
+
+    // Larger than the initial index buffer, and not a multiple of 4 bytes.
+    let odd_len = 128 * 1024 + 2;
+    rd.map_indices(odd_len).fill(0);
+    rd.unmap_indices();
 
     rd.end_onscreen_render();
 
