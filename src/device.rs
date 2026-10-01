@@ -757,7 +757,7 @@ impl UniformRing {
     fn write(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> u32 {
         assert!(
             self.next_slot < self.slot_capacity,
-            "uniform ring (struct_size={}) exhausted at {} slots — raise UNIFORM_RING_SLOTS",
+            "uniform ring (struct_size={}) exhausted at {} slots; raise UNIFORM_RING_SLOTS",
             self.struct_size,
             self.slot_capacity,
         );
@@ -1203,8 +1203,7 @@ impl WgpuRenderDevice {
     pub fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
         assert_eq!(
             desc.sample_count, 1,
-            "Phase 4.B only supports sample_count = 1 (use PPAA for anti-aliasing); \
-             MSAA support lands later",
+            "create_render_target: MSAA is unsupported, sample_count must be 1",
         );
 
         let rt_handle = RenderTargetHandle(self.alloc_handle());

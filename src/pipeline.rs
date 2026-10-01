@@ -191,7 +191,7 @@ impl PipelineCache {
     pub fn get(&self, key: PipelineKey) -> &wgpu::RenderPipeline {
         self.cache
             .get(&key)
-            .expect("pipeline not built — call ensure() before get()")
+            .expect("pipeline not built; call ensure() before get()")
     }
 }
 
