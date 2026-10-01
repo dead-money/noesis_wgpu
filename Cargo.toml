@@ -29,9 +29,13 @@ shim = ["noesis_runtime/shim"]
 [dependencies]
 log = "0.4"
 noesis_runtime = { path = "../noesis_runtime", version = "0.13", default-features = false }
-wgpu = "29.0.3"
+# No default features: the application picks wgpu's backends. `wgsl` compiles
+# noesis.wgsl.
+wgpu = { version = "29.0.3", default-features = false, features = ["wgsl"] }
 
 [dev-dependencies]
+# The tests need a backend; wgpu's defaults bring the native ones.
+wgpu = "29.0.3"
 bytemuck = "1.25"
 pollster = "0.4"
 
