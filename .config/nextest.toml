@@ -1,0 +1,12 @@
+# Each GPU test runs in its own process, as in noesis_bevy: creating many wgpu
+# devices at once in one process crashes some drivers.
+
+[profile.default]
+test-threads = 8
+# Warn after a minute, and stop a test that hangs.
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.ci]
+retries = 0
+fail-fast = false
+failure-output = "immediate-final"
