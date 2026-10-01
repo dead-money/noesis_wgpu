@@ -50,7 +50,7 @@ too_many_arguments = "allow"
 indexing_slicing = "allow"
 many_single_char_names = "allow"
 
-# `panic`: render-device phase guards.
+# `panic`: invariants of the SDK lookup tables.
 panic = "allow"
 
 # Correctness

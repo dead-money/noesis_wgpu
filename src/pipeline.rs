@@ -166,7 +166,7 @@ impl PipelineCache {
 
     /// Builds the pipeline for `key` if it isn't cached yet, and returns
     /// `false` when `key.shader` has no WGSL variant (see
-    /// [`defines_for_shader`]). Fetch the pipeline with [`Self::get`]; the
+    /// [`defines_for_shader`]) or needs a device feature that's missing. Fetch the pipeline with [`Self::get`]; the
     /// split lets the caller hold other borrows between the two calls. A
     /// variant that fails WGSL validation is reported through the wgpu
     /// device's error handler.
@@ -177,6 +177,14 @@ impl PipelineCache {
         let Some(defines) = defines_for_shader(Shader(key.shader)) else {
             return false;
         };
+        if key.shader == Shader::SDF_LCD_SOLID.0
+            && !self
+                .device
+                .features()
+                .contains(wgpu::Features::DUAL_SOURCE_BLENDING)
+        {
+            return false;
+        }
         let pipeline = build_pipeline(
             &self.device,
             &self.pipeline_layout,

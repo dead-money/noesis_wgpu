@@ -3,15 +3,20 @@
 //!
 //! Covers a draw outside a phase, a paint-texture shader with no texture, an
 //! unknown texture handle, an unknown render target, geometry past the mapped
-//! buffers, and shaders the device doesn't implement.
+//! buffers, and shaders the device doesn't implement. Texture updates that
+//! leave the texture or lack data are skipped too, and a tile larger than the
+//! target is clipped to it.
 
 use std::ffi::c_void;
 use std::num::NonZeroU64;
 
 use noesis_runtime::render_device::types::{
-    Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, Tile, UniformData,
+    Batch, BlendMode, RenderState, SamplerState, Shader, StencilMode, TextureFormat, Tile,
+    UniformData,
 };
-use noesis_runtime::render_device::{RenderTargetDesc, RenderTargetHandle, TextureHandle};
+use noesis_runtime::render_device::{
+    RenderTargetDesc, RenderTargetHandle, TextureDesc, TextureHandle, TextureRect,
+};
 use noesis_wgpu::{BatchTextures, DeviceStats, WgpuRenderDevice};
 
 const RT_SIZE: u32 = 4;
@@ -72,6 +77,24 @@ async fn run_test() {
     // Outside any phase.
     rd.draw_batch_with(&rgba, BatchTextures::default());
 
+    // A rect outside a 1x1 texture, then a rect with too little data.
+    let tex = rd.create_texture(TextureDesc {
+        label: "skipped-draws texture",
+        width: 1,
+        height: 1,
+        num_levels: 1,
+        format: TextureFormat::Rgba8,
+        data: None,
+    });
+    let rect = |width, height| TextureRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    };
+    rd.update_texture(tex.handle, 0, rect(2, 2), &[0; 16]);
+    rd.update_texture(tex.handle, 0, rect(1, 1), &[0; 2]);
+
     rd.begin_offscreen_render();
     rd.map_vertices(vb.len() as u32).copy_from_slice(&vb);
     rd.unmap_vertices();
@@ -84,7 +107,8 @@ async fn run_test() {
     rd.draw_batch_with(&rgba, BatchTextures::default());
 
     rd.set_render_target(rt.handle);
-    rd.begin_tile(rt.handle, full_tile());
+    // Twice the target's size; the scissor is clipped to the target.
+    rd.begin_tile(rt.handle, oversized_tile());
     // A pattern shader without a pattern texture, then with an unknown one.
     rd.draw_batch_with(&batch(Shader::PATH_PATTERN, 6), BatchTextures::default());
     let unknown = BatchTextures {
@@ -115,12 +139,12 @@ async fn run_test() {
     assert_eq!(pixel, [255, 0, 0, 255], "the good draw still renders");
 }
 
-fn full_tile() -> Tile {
+fn oversized_tile() -> Tile {
     Tile {
         x: 0,
         y: 0,
-        width: RT_SIZE,
-        height: RT_SIZE,
+        width: RT_SIZE * 2,
+        height: RT_SIZE * 2,
     }
 }
 

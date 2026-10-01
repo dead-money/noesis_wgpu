@@ -489,8 +489,12 @@ impl WgpuRenderDevice {
     ///
     /// Call it between `end_*_render` and the next `begin_*_render`. Called
     /// inside a phase, it logs a warning and the draws that follow use the new
-    /// target.
+    /// target. A zero-sized target logs a warning and is ignored.
     pub fn set_onscreen_target(&mut self, view: wgpu::TextureView, width: u32, height: u32) {
+        if width == 0 || height == 0 {
+            warn!("set_onscreen_target: {width}x{height} target ignored");
+            return;
+        }
         if self.phase != FramePhase::Idle {
             warn!(
                 "set_onscreen_target called inside the {:?} phase",
@@ -582,6 +586,16 @@ impl WgpuRenderDevice {
             batch.pixel_uniforms[1].as_bytes(),
         )
     }
+}
+
+/// `tile` (bottom-left origin) as a top-left scissor rect, clipped to the
+/// target: wgpu rejects a scissor that leaves it.
+fn tile_scissor(tile: Tile, width: u32, height: u32) -> (u32, u32, u32, u32) {
+    let x = tile.x.min(width);
+    let w = tile.width.min(width - x);
+    let bottom = tile.y.min(height);
+    let h = tile.height.min(height - bottom);
+    (x, height - bottom - h, w, h)
 }
 
 const fn round_up_to_4(n: usize) -> usize {
@@ -1114,7 +1128,8 @@ impl WgpuRenderDevice {
 
     /// Creates a texture and uploads its initial mip levels, if `desc` has
     /// any. `Rgbx8` is stored as `Rgba8Unorm` and reported without alpha.
-    /// Extra data levels are ignored, with a warning.
+    /// Extra data levels are ignored, and a level with too little data is left
+    /// unwritten, each with a warning.
     pub fn create_texture(&mut self, desc: TextureDesc<'_>) -> TextureBinding {
         let handle = TextureHandle(self.alloc_handle());
         let wgpu_format = wgpu_format_for(desc.format);
@@ -1148,6 +1163,16 @@ impl WgpuRenderDevice {
                 let level_u32 = level as u32;
                 let w = (desc.width >> level_u32).max(1);
                 let h = (desc.height >> level_u32).max(1);
+                let needed = u64::from(w) * u64::from(h) * u64::from(bpp);
+                if (bytes.len() as u64) < needed {
+                    warn!(
+                        "create_texture '{}': level {level} has {} bytes, needs {needed}; \
+                         leaving it unwritten",
+                        desc.label,
+                        bytes.len(),
+                    );
+                    continue;
+                }
                 self.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &texture,
@@ -1196,8 +1221,8 @@ impl WgpuRenderDevice {
 
     /// Writes `data` into `rect` of mip `level`. `data` is tightly packed,
     /// with no row padding.
-    /// An unknown handle or a level the texture doesn't have logs a warning
-    /// and writes nothing.
+    /// An unknown handle, a level the texture doesn't have, a rect outside the
+    /// level, or too little data logs a warning and writes nothing.
     pub fn update_texture(
         &mut self,
         handle: TextureHandle,
@@ -1216,7 +1241,25 @@ impl WgpuRenderDevice {
             );
             return;
         }
+        let level_w = (tex.width >> level).max(1);
+        let level_h = (tex.height >> level).max(1);
+        if rect.x.saturating_add(rect.width) > level_w
+            || rect.y.saturating_add(rect.height) > level_h
+        {
+            warn!("update_texture: rect {rect:?} outside level {level} ({level_w}x{level_h})");
+            return;
+        }
         let bpp = bytes_per_pixel(tex.noesis_format);
+        let needed = u64::from(rect.width) * u64::from(rect.height) * u64::from(bpp);
+        if (data.len() as u64) < needed {
+            warn!(
+                "update_texture: {} bytes for a {}x{} rect that needs {needed}",
+                data.len(),
+                rect.width,
+                rect.height,
+            );
+            return;
+        }
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &tex.texture,
@@ -1642,11 +1685,9 @@ impl WgpuRenderDevice {
                 return Err(SkippedDraw::Protocol);
             };
             self.current_rt_stencil_cleared = true;
-            // Noesis tiles are bottom-left origin; wgpu scissors top-left.
-            let scissor = self.current_tile.map(|t| {
-                let y_top = rt.height.saturating_sub(t.y + t.height);
-                (t.x, y_top, t.width, t.height)
-            });
+            let scissor = self
+                .current_tile
+                .map(|t| tile_scissor(t, rt.width, rt.height));
             let stencil = rt.stencil.as_ref().map(|(_, view)| view);
             (&rt.color_view, scissor, stencil)
         } else {
