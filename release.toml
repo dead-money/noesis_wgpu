@@ -1,0 +1,13 @@
+# cargo-release: bumps, stamps CHANGELOG.md, commits, tags vX.Y.Z, and pushes.
+# The tag triggers release.yml, which publishes; nothing publishes from here.
+
+publish = false
+tag = true
+tag-name = "v{{version}}"
+push = true
+# release/0.N branches carry older wgpu lines; see RELEASING.md.
+allow-branch = ["main", "release/*"]
+
+pre-release-replacements = [
+  { file = "CHANGELOG.md", search = "## \\[Unreleased\\]", replace = "## [Unreleased]\n\n## [{{version}}] - {{date}}", exactly = 1 },
+]

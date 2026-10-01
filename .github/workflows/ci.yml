@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "release/**"]
+  pull_request:
+    branches: [main, "release/**"]
+
+env:
+  CARGO_TERM_COLOR: always
+  # Run JS-based actions on Node 24; Node 20 is deprecated on GitHub runners.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  # No SDK needed, so this runs on hosted runners, including for fork PRs.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  # Catches broken intra-doc links before they reach docs.rs. DOCS_RS makes
+  # noesis_runtime's build script skip the native compile, so this needs no SDK.
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    env:
+      DOCS_RS: "1"
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo doc
+        run: cargo doc --no-deps --all-features
+
+  # Without `shim` nothing links Noesis, so the GPU tests run on hosted runners
+  # through lavapipe, Mesa's software Vulkan driver.
+  no-shim:
+    name: build • clippy • test (no shim)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --no-default-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --no-default-features
+
+  # Needs the Noesis SDK, which only the self-hosted runner has. Fork PRs are
+  # skipped so untrusted code never runs there.
+  build-test:
+    name: build • clippy • test
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, noesis-sdk]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # Keep target/ for incremental builds.
+          clean: false
+
+      # Runners may have other SDK versions installed; pin the one the crate targets.
+      - name: Verify Noesis SDK version
+        run: |
+          grep -Fxq "3.2.13 (r17073)" "$NOESIS_SDK_DIR/version.txt" || {
+            echo "::error::Runner '$RUNNER_NAME' has an unexpected Noesis SDK at $NOESIS_SDK_DIR:"
+            cat "$NOESIS_SDK_DIR/version.txt"
+            exit 1
+          }
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all-features
