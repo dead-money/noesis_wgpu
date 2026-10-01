@@ -53,4 +53,4 @@ mod shader_defines;
 mod shader_preproc;
 mod vertex_layout;
 
-pub use device::{BatchTextures, WgpuRenderDevice};
+pub use device::{BatchTextures, DeviceStats, WgpuRenderDevice};

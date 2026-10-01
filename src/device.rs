@@ -116,6 +116,8 @@ pub struct WgpuRenderDevice {
     pipelines: PipelineCache,
     // Shaders already reported as unsupported.
     warned_shaders: HashSet<u8>,
+    // `pipelines` is filled in by `stats()`.
+    stats: DeviceStats,
 
     // Entries removed by `drop_texture` / `drop_render_target`.
     textures: HashMap<TextureHandle, GpuTexture>,
@@ -373,6 +375,7 @@ impl WgpuRenderDevice {
             dummy_sampler,
             pipelines,
             warned_shaders: HashSet::new(),
+            stats: DeviceStats::default(),
             textures: HashMap::new(),
             render_targets: HashMap::new(),
             target_view: None,
@@ -529,6 +532,16 @@ impl WgpuRenderDevice {
     #[must_use]
     pub fn texture(&self, handle: TextureHandle) -> Option<&wgpu::Texture> {
         self.textures.get(&handle).map(|t| &t.texture)
+    }
+
+    /// Counts of the batches drawn and skipped since the device was created,
+    /// and the pipelines compiled so far.
+    #[must_use]
+    pub fn stats(&self) -> DeviceStats {
+        DeviceStats {
+            pipelines: self.pipelines.len(),
+            ..self.stats
+        }
     }
 
     /// Pixel size the render target `handle` was created with. `None` once
@@ -854,6 +867,11 @@ impl GeometryStream {
 
     fn segment_base(&self) -> u64 {
         self.segment_base
+    }
+
+    /// End of the data uploaded this phase.
+    fn written_end(&self) -> u64 {
+        self.cursor
     }
 
     fn reset(&mut self) {
@@ -1518,8 +1536,14 @@ impl WgpuRenderDevice {
     /// an unknown handle, one whose geometry runs past the mapped buffers, and
     /// one whose shader this device doesn't implement (custom effects, the
     /// `SDF_*` gradient and pattern paints, and most `SDF_LCD_*` variants).
+    ///
+    /// [`stats`](Self::stats) counts what was drawn and what was skipped.
     pub fn draw_batch_with(&mut self, batch: &Batch, textures: BatchTextures) {
-        let _ = self.record_draw(batch, textures);
+        match self.record_draw(batch, textures) {
+            Ok(()) => self.stats.draws += 1,
+            Err(SkippedDraw::Protocol) => self.stats.dropped_draws += 1,
+            Err(SkippedDraw::UnsupportedShader) => self.stats.unsupported_shader_draws += 1,
+        }
     }
 
     #[allow(clippy::too_many_lines)] // one pass of checks, then one render pass
@@ -1551,10 +1575,6 @@ impl WgpuRenderDevice {
             self.warn_unsupported_shader(batch.shader.0);
             return Err(SkippedDraw::UnsupportedShader);
         };
-        if !self.pipelines.ensure(key) {
-            self.warn_unsupported_shader(batch.shader.0);
-            return Err(SkippedDraw::UnsupportedShader);
-        }
 
         // Build bind groups before borrowing `encoder` mutably.
         let pattern_slot = if shader_uses_paint_texture(batch.shader.0) {
@@ -1595,14 +1615,19 @@ impl WgpuRenderDevice {
             None
         };
 
+        if !self.pipelines.ensure(key) {
+            self.warn_unsupported_shader(batch.shader.0);
+            return Err(SkippedDraw::UnsupportedShader);
+        }
+
         // Batch offsets are relative to the latest unmapped segment.
         let stride = u64::from(SIZE_FOR_FORMAT[key.vertex_format as usize]);
         let vertex_offset = self.vertex_stream.segment_base() + u64::from(batch.vertex_offset);
         let vertex_byte_count = u64::from(batch.num_vertices) * stride;
         let index_byte_offset = self.index_stream.segment_base() + u64::from(batch.start_index) * 2;
         let index_byte_count = u64::from(batch.num_indices) * 2;
-        if vertex_offset + vertex_byte_count > self.vertex_stream.buffer().size()
-            || index_byte_offset + index_byte_count > self.index_stream.buffer().size()
+        if vertex_offset + vertex_byte_count > self.vertex_stream.written_end()
+            || index_byte_offset + index_byte_count > self.index_stream.written_end()
         {
             warn_once!("batch geometry runs past the mapped buffers; skipping");
             return Err(SkippedDraw::Protocol);
@@ -1707,6 +1732,44 @@ impl WgpuRenderDevice {
     fn warn_unsupported_shader(&mut self, shader: u8) {
         if self.warned_shaders.insert(shader) {
             warn!("Noesis shader {shader} isn't implemented; skipping its batches");
+        }
+    }
+}
+
+/// What a [`WgpuRenderDevice`] has drawn, from [`WgpuRenderDevice::stats`].
+///
+/// The batch counts add up over the device's life; subtract an earlier
+/// snapshot to get one frame's figures. Each skipped batch also logs a warning,
+/// once per cause.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct DeviceStats {
+    /// Batches drawn.
+    pub draws: u64,
+    /// Batches skipped because a call broke the render-device protocol: a draw
+    /// outside a phase or without a target, a texture the batch's shader needs
+    /// but didn't get, an unknown handle, or geometry past the mapped buffers.
+    pub dropped_draws: u64,
+    /// Batches skipped because the device has no variant of their shader,
+    /// such as a custom effect.
+    pub unsupported_shader_draws: u64,
+    /// Render pipelines compiled so far, one per shader, render state, vertex
+    /// format and stencil combination drawn.
+    pub pipelines: usize,
+}
+
+impl std::ops::Sub for DeviceStats {
+    type Output = Self;
+
+    /// The batch counts between `rhs`, an earlier snapshot, and `self`.
+    /// `pipelines` is `self`'s.
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            draws: self.draws.saturating_sub(rhs.draws),
+            dropped_draws: self.dropped_draws.saturating_sub(rhs.dropped_draws),
+            unsupported_shader_draws: self
+                .unsupported_shader_draws
+                .saturating_sub(rhs.unsupported_shader_draws),
+            pipelines: self.pipelines,
         }
     }
 }

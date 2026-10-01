@@ -16,6 +16,12 @@ pre-1.0, any `0.x` release may contain breaking changes.
   skipped with one warning per shader, and an MSAA render target is created
   single-sampled.
 
+### Added
+
+- `WgpuRenderDevice::stats` returns a `DeviceStats`: batches drawn, batches
+  skipped for a protocol violation or an unsupported shader, and pipelines
+  compiled. Subtracting two snapshots gives one frame's counts.
+
 ### Fixed
 
 - A render phase is no longer limited to 1024 draws. The per-draw uniform rings

@@ -188,6 +188,12 @@ impl PipelineCache {
         true
     }
 
+    /// Number of pipelines built so far.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.cache.len()
+    }
+
     /// Returns the pipeline built by [`Self::ensure`] for `key`.
     ///
     /// # Panics

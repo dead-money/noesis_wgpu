@@ -11,5 +11,6 @@ mod wgpu_pattern_wrap;
 mod wgpu_radial;
 mod wgpu_sdf_lcd;
 mod wgpu_shadow_blur;
+mod wgpu_skipped_draws;
 mod wgpu_stencil_clip;
 mod wgpu_uniform_ring;
