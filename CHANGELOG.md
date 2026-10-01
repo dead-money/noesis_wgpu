@@ -39,5 +39,7 @@ crate of its own:
   itself can drive the device without `noesis_runtime`'s shim.
 - The default `shim` feature implements `noesis_runtime`'s `RenderDevice`
   trait. Without it the crate builds with no Noesis SDK.
+- Fixed: mapping more geometry than the stream's staging buffer held, with a
+  length that isn't a multiple of 4, no longer panics at unmap.
 
 [Unreleased]: https://github.com/dead-money/noesis_wgpu/commits/main

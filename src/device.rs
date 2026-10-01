@@ -888,8 +888,10 @@ impl GeometryStream {
             );
         }
         let len = bytes as usize;
-        if len > self.staging.len() {
-            self.staging.resize(len, 0);
+        // `unmap` uploads a 4-byte-padded length, so keep the padding in range.
+        let padded = round_up_to_4(len);
+        if padded > self.staging.len() {
+            self.staging.resize(padded, 0);
         }
         self.mapped_bytes = Some(bytes);
         &mut self.staging[..len]
