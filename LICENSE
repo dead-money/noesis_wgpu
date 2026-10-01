@@ -25,12 +25,14 @@ SOFTWARE.
 Note on the Noesis Native SDK
 -----------------------------
 
-This crate links (transitively, via the `noesis_runtime` crate)
-against the Noesis Native SDK (libNoesis), which is closed-source commercial
-software distributed by Noesis Technologies S.L. under their own End User
-License Agreement. The Noesis SDK is **not** included in this repository; it
-must be obtained separately from https://www.noesisengine.com/ and supplied at
-build time via the NOESIS_SDK_DIR environment variable.
+With its default `shim` feature, this crate links (through the
+`noesis_runtime` crate) against the Noesis Native SDK (libNoesis), which is
+closed-source commercial software distributed by Noesis Technologies S.L.
+under their own End User License Agreement. The Noesis SDK is **not** included
+in this repository; it must be obtained separately from
+https://www.noesisengine.com/ and supplied at build time via the
+NOESIS_SDK_DIR environment variable. Without the `shim` feature, the crate
+links no Noesis library.
 
 The MIT terms above apply only to the source code in this repository. Use,
 distribution, and licensing of binaries built against the Noesis SDK are

@@ -13,10 +13,10 @@ pre-1.0, any `0.x` release may contain breaking changes.
   phase or without a target, a missing batch texture, geometry past the mapped
   buffers, a mismatched tile, an unbalanced map, or a texture update outside
   the texture or short of data logs a warning and skips the call or the draw.
-  A tile larger than its render target is clipped to it. A batch whose shader the device doesn't implement is
-  skipped with one warning per shader, as is `SDF_LCD_SOLID` on a wgpu device
-  without `DUAL_SOURCE_BLENDING`. An MSAA render target is created
-  single-sampled.
+  A tile larger than its render target is clipped to it. A batch whose shader
+  the device doesn't implement is skipped with one warning per shader, as is
+  `SDF_LCD_SOLID` on a wgpu device without `DUAL_SOURCE_BLENDING`. An MSAA
+  render target is created single-sampled.
 
 ### Added
 
