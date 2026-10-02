@@ -86,16 +86,29 @@ let textures = BatchTextures {
 device.draw_batch_with(batch, textures);
 ```
 
+Custom shaders work the same way. The host compiles each WGSL shader with `create_pixel_shader`, keeps the returned handle next to the pointer it hands Noesis's `BrushShader` or `ShaderEffect`, and draws a batch whose `pixel_shader` is set with the handle, the extra textures and the constants:
+
+```rust
+use noesis_wgpu::BatchShader;
+
+let mut shader = BatchShader::new(shader_for(batch.pixel_shader));
+shader.textures[0] = Some((mask_texture, batch.pattern_sampler));
+device.draw_custom_batch(batch, textures, shader);
+```
+
 ## How it works
 
 - **One shader source.** `noesis.wgsl` covers Noesis's shader set with `#ifdef` branches, the convention of Noesis's own GL shaders. The device strips it down to one variant per Noesis shader and compiles a pipeline the first time a draw needs that shader, render state, vertex format, and stencil combination.
 - **One encoder per phase.** `begin_offscreen_render` and `begin_onscreen_render` each open a command encoder, and the matching `end_*` submits it. Every draw records its own render pass.
 - **Per-draw uniforms.** All of a phase's buffer writes land before its encoder is submitted, so each draw writes its uniforms to its own slot of a ring buffer, which doubles when a phase fills it, and geometry is appended rather than overwritten.
 - **Stencil clipping.** Render targets that ask for one, and the onscreen target, get a `Stencil8` buffer, cleared before the first draw into each target.
+- **MSAA render targets.** A render target created with more than one sample is 4x multisampled and resolved into the texture Noesis samples.
+- **Custom shaders.** `create_pixel_shader` compiles WGSL for Noesis's `BrushShader` and `ShaderEffect`. A brush replaces the pattern fetch of whichever pattern shader draws it, so one brush paints paths, text and opacity masks; an effect draws `CUSTOM_EFFECT` batches. WGSL that fails wgpu's validation comes back as an error rather than reaching the device's error handler.
+- **Host textures.** `import_texture` wraps a `wgpu::Texture` the host keeps rendering into, such as a character preview, without copying it. `set_pattern_lod` sets a mip bias and a highest mip level for images.
 - **No panics on a bad call.** A call that breaks the protocol, such as an unknown handle or a draw outside a phase, logs a warning and is skipped, as is a batch whose shader the device doesn't implement. Hosts that build with `panic = "abort"` keep running, and `stats()` counts the skipped batches next to the drawn ones and the compiled pipelines.
-- **No extra wgpu features.** Text uses Noesis's grayscale SDF path. Subpixel (LCD) text, which needs dual-source blending, is off.
+- **No extra wgpu features.** Text uses Noesis's grayscale SDF path, with solid, gradient and pattern paints. Subpixel (LCD) text, which needs dual-source blending, is off. wgpu samplers have no LOD bias, so the shaders apply `set_pattern_lod`'s.
 
-What it doesn't do yet: MSAA render targets (Noesis's offscreen sample count must stay 1), custom pixel shaders (`ShaderEffect` and `BrushShader` batches), and the `SDF_*` gradient and pattern paints.
+What it doesn't do yet: the `SDF_LCD_*` shaders other than `SDF_LCD_SOLID`, the depth test of the `*_ZTest` stencil modes (3D-transformed UI), and single-pass stereo.
 
 ## Version compatibility
 

@@ -31,10 +31,10 @@ struct PsUniforms0 {
 
 @group(1) @binding(0) var<uniform> ps_uniforms0: PsUniforms0;
 
-// cbuffer1_ps: read only by EFFECT_SHADOW / EFFECT_BLUR. Noesis declares
-// float[128], but those effects use at most the first 7 floats, so two vec4s
-// (values[0] = cb[0..3], values[1] = cb[4..7]). Shares group(1) to stay within
-// the downlevel 4-bind-group limit.
+// cbuffer1_ps: read by EFFECT_SHADOW / EFFECT_BLUR, and by custom shaders as
+// their `Constants`. Noesis declares float[128]; the effects use at most the
+// first 7 floats, so two vec4s (values[0] = cb[0..3], values[1] = cb[4..7]).
+// Shares group(1) to stay within the downlevel 4-bind-group limit.
 #ifdef HAS_CBUFFER1_PS
 struct PsUniforms1 {
     values: array<vec4<f32>, 2>,
@@ -43,12 +43,40 @@ struct PsUniforms1 {
 @group(1) @binding(1) var<uniform> ps_uniforms1: PsUniforms1;
 #endif
 
-// group(2): the paint texture. Holds `pattern`, `ramps`, or `glyphs`
-// depending on the shader, and the DOWNSAMPLE/UPSAMPLE source. Shaders that
-// don't read it get a dummy bind group.
+// A custom shader's constants. Its own source declares `struct Constants`.
+#ifdef CUSTOM_CONSTANTS
+@group(1) @binding(1) var<uniform> constants: Constants;
+#endif
+
+// The host's mip policy for pattern textures, from `set_pattern_lod`:
+// x is the LOD bias, y the highest mip level sampled.
+#ifdef PAINT_PATTERN
+struct PatternLod {
+    values: vec4<f32>,
+}
+
+@group(1) @binding(2) var<uniform> pattern_lod: PatternLod;
+#endif
+
+// group(2): the paint texture. Holds `pattern` or `ramps` depending on the
+// shader, the DOWNSAMPLE/UPSAMPLE source, or a custom effect's input. Shaders
+// that don't read it get a dummy bind group.
 #ifdef HAS_PAINT_TEXTURE
 @group(2) @binding(0) var paint_texture: texture_2d<f32>;
 @group(2) @binding(1) var paint_sampler: sampler;
+#endif
+
+// group(2) bindings 2-9: a custom shader's extra textures. Slots the shader
+// doesn't use are bound to a 1x1 white texture.
+#ifdef CUSTOM_SHADER
+@group(2) @binding(2) var extra_texture0: texture_2d<f32>;
+@group(2) @binding(3) var extra_sampler0: sampler;
+@group(2) @binding(4) var extra_texture1: texture_2d<f32>;
+@group(2) @binding(5) var extra_sampler1: sampler;
+@group(2) @binding(6) var extra_texture2: texture_2d<f32>;
+@group(2) @binding(7) var extra_sampler2: sampler;
+@group(2) @binding(8) var extra_texture3: texture_2d<f32>;
+@group(2) @binding(9) var extra_sampler3: sampler;
 #endif
 
 // group(3) bindings 0/1: `image`, the offscreen render of the layer being
@@ -63,6 +91,13 @@ struct PsUniforms1 {
 #ifdef HAS_SHADOW_TEXTURE
 @group(3) @binding(2) var shadow_texture: texture_2d<f32>;
 @group(3) @binding(3) var shadow_sampler: sampler;
+#endif
+
+// group(3) bindings 4/5: the SDF glyph atlas, apart from the paint texture so
+// glyphs can be painted with a gradient or pattern.
+#ifdef HAS_GLYPHS_TEXTURE
+@group(3) @binding(4) var glyphs_texture: texture_2d<f32>;
+@group(3) @binding(5) var glyphs_sampler: sampler;
 #endif
 
 // ─── Vertex I/O ───
@@ -180,6 +215,101 @@ fn vs_main(in: VsIn) -> VsOut {
     return out;
 }
 
+// ─── Pattern sampling ───
+// wgpu samplers have no LOD bias, so the pattern paints scale the uv
+// derivatives instead: the hardware then picks mip level
+// min(lod + bias, max_level), where lod is the level it would pick unscaled.
+#ifdef PAINT_PATTERN
+fn sample_pattern_grad(uv: vec2<f32>, ddx: vec2<f32>, ddy: vec2<f32>) -> vec4<f32> {
+    let size = vec2<f32>(textureDimensions(paint_texture));
+    let lod = log2(max(max(length(ddx * size), length(ddy * size)), 1e-6));
+    let biased = min(lod + pattern_lod.values.x, pattern_lod.values.y);
+    let scale = exp2(biased - lod);
+    return textureSampleGrad(paint_texture, paint_sampler, uv, ddx * scale, ddy * scale);
+}
+#endif
+
+// ─── Custom shaders ───
+// The functions a custom shader's source can call. fs_main fills the
+// `custom_*` privates before it calls the shader's `main_brush` or
+// `main_effect`. Every helper samples with explicit derivatives or level, so
+// they work in non-uniform control flow too.
+#ifdef CUSTOM_SHADER
+var<private> custom_uv0: vec2<f32>;
+var<private> custom_uv0_ddx: vec2<f32>;
+var<private> custom_uv0_ddy: vec2<f32>;
+
+// Samples extra texture `index` (0-3). The mip level follows uv0's rate of
+// change on screen, which suits textures laid over the same area as uv0.
+fn sample_texture(index: u32, uv: vec2<f32>) -> vec4<f32> {
+    let ddx = custom_uv0_ddx;
+    let ddy = custom_uv0_ddy;
+    var color: vec4<f32>;
+    switch index {
+        case 0u: {
+            color = textureSampleGrad(extra_texture0, extra_sampler0, uv, ddx, ddy);
+        }
+        case 1u: {
+            color = textureSampleGrad(extra_texture1, extra_sampler1, uv, ddx, ddy);
+        }
+        case 2u: {
+            color = textureSampleGrad(extra_texture2, extra_sampler2, uv, ddx, ddy);
+        }
+        default: {
+            color = textureSampleGrad(extra_texture3, extra_sampler3, uv, ddx, ddy);
+        }
+    }
+    return color;
+}
+#endif
+
+// A brush shader's image, Noesis's `SampleImage`, under the host's pattern
+// mip policy.
+#ifdef CUSTOM_PATTERN
+fn sample_image(uv: vec2<f32>) -> vec4<f32> {
+    return sample_pattern_grad(uv, custom_uv0_ddx, custom_uv0_ddy);
+}
+#endif
+
+// An effect shader's input, after Noesis's EffectHelpers.h. The input may sit
+// inside an atlas, so `input_coordinate` is only for sampling the input.
+#ifdef EFFECT_CUSTOM
+var<private> custom_rect: vec4<f32>;
+var<private> custom_image_pos: vec4<f32>;
+
+fn input_coordinate() -> vec2<f32> {
+    return custom_uv0;
+}
+
+// The input coordinate in 0..1 across the effect's area.
+fn normalized_input_coordinate() -> vec2<f32> {
+    return (custom_uv0 - custom_rect.xy) / (custom_rect.zw - custom_rect.xy);
+}
+
+// The pixel's position in the effect's area, in pixels.
+fn image_position() -> vec2<f32> {
+    return custom_image_pos.xy;
+}
+
+fn sample_input(uv: vec2<f32>) -> vec4<f32> {
+    return textureSampleLevel(paint_texture, paint_sampler, uv, 0.0);
+}
+
+fn get_input() -> vec4<f32> {
+    return sample_input(custom_uv0);
+}
+
+// Samples the input `offset` pixels away, clamped to the effect's area.
+fn sample_input_at_offset(offset: vec2<f32>) -> vec4<f32> {
+    let uv = custom_uv0 + offset * custom_image_pos.zw;
+    return sample_input(clamp(uv, custom_rect.xy, custom_rect.zw));
+}
+
+fn sample_input_at_position(pos: vec2<f32>) -> vec4<f32> {
+    return sample_input_at_offset(pos - custom_image_pos.xy);
+}
+#endif
+
 // ─── Fragment shader ───
 //
 // Each variant keeps one PAINT_* block (defining `paint` and `opacity`) and
@@ -189,6 +319,16 @@ fn vs_main(in: VsIn) -> VsOut {
 #ifndef EFFECT_SDF_LCD
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+#ifdef CUSTOM_SHADER
+    custom_uv0 = in.uv0;
+    custom_uv0_ddx = dpdx(in.uv0);
+    custom_uv0_ddy = dpdy(in.uv0);
+#endif
+#ifdef EFFECT_CUSTOM
+    custom_rect = in.rect;
+    custom_image_pos = in.image_pos;
+#endif
+
 #ifdef EFFECT_RGBA
     return ps_uniforms0.values[0];
 #endif
@@ -214,7 +354,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 #ifdef PAINT_PATTERN_PLAIN
     // The sampler handles wrap and filtering.
-    let paint = textureSample(paint_texture, paint_sampler, in.uv0);
+    let paint = sample_pattern_grad(in.uv0, dpdx(in.uv0), dpdy(in.uv0));
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
@@ -223,22 +363,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // texture, which a sampler wrap mode can't do.
     let clamped_uv = clamp(in.uv0, in.rect.xy, in.rect.zw);
     let inside = select(0.0, 1.0, all(in.uv0 == clamped_uv));
-    let paint = inside * textureSample(paint_texture, paint_sampler, in.uv0);
+    let paint = inside * sample_pattern_grad(in.uv0, dpdx(in.uv0), dpdy(in.uv0));
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
 #ifdef REPEAT_PATTERN
     // `tile` = (origin.xy, size.zw). Normalise uv into tile-local space,
     // `fract` to wrap, then lift back into pattern UV space and clamp by
-    // `rect`. `textureSampleGrad` preserves the original screen-space
-    // derivatives so the sampler picks the right mip despite the UV wrap.
+    // `rect`. Sampling with uv0's derivatives keeps the mip choice right
+    // across the wrap's jumps.
     let raw = (in.uv0 - in.tile.xy) / in.tile.zw;
     let wrap = fract(raw);
     let uv = wrap * in.tile.zw + in.tile.xy;
     let clamped_uv = clamp(uv, in.rect.xy, in.rect.zw);
     let inside = select(0.0, 1.0, all(uv == clamped_uv));
-    let paint = inside
-        * textureSampleGrad(paint_texture, paint_sampler, uv, dpdx(in.uv0), dpdy(in.uv0));
+    let paint = inside * sample_pattern_grad(uv, dpdx(in.uv0), dpdy(in.uv0));
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
@@ -254,8 +393,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = wrap * in.tile.zw + in.tile.xy;
     let clamped_uv = clamp(uv, in.rect.xy, in.rect.zw);
     let inside = select(0.0, 1.0, all(uv == clamped_uv));
-    let paint = inside
-        * textureSampleGrad(paint_texture, paint_sampler, uv, dpdx(in.uv0), dpdy(in.uv0));
+    let paint = inside * sample_pattern_grad(uv, dpdx(in.uv0), dpdy(in.uv0));
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
@@ -269,8 +407,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = wrap * in.tile.zw + in.tile.xy;
     let clamped_uv = clamp(uv, in.rect.xy, in.rect.zw);
     let inside = select(0.0, 1.0, all(uv == clamped_uv));
-    let paint = inside
-        * textureSampleGrad(paint_texture, paint_sampler, uv, dpdx(in.uv0), dpdy(in.uv0));
+    let paint = inside * sample_pattern_grad(uv, dpdx(in.uv0), dpdy(in.uv0));
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
@@ -281,8 +418,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let uv = wrap * in.tile.zw + in.tile.xy;
     let clamped_uv = clamp(uv, in.rect.xy, in.rect.zw);
     let inside = select(0.0, 1.0, all(uv == clamped_uv));
-    let paint = inside
-        * textureSampleGrad(paint_texture, paint_sampler, uv, dpdx(in.uv0), dpdy(in.uv0));
+    let paint = inside * sample_pattern_grad(uv, dpdx(in.uv0), dpdy(in.uv0));
+    let opacity = ps_uniforms0.values[0].x;
+#endif
+
+#ifdef CUSTOM_PATTERN
+    // The brush shader stands in for the pattern fetch (GL ref CUSTOM_PATTERN).
+    let paint = main_brush(in.uv0);
     let opacity = ps_uniforms0.values[0].x;
 #endif
 
@@ -401,7 +543,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let SDF_BASE_MAX: f32 = 0.25;
     let SDF_BASE_DEV: f32 = -0.65;
 
-    let distance = SDF_SCALE * (textureSample(paint_texture, paint_sampler, in.uv1).r - SDF_BIAS);
+    let glyph = textureSample(glyphs_texture, glyphs_sampler, in.uv1).r;
+    let distance = SDF_SCALE * (glyph - SDF_BIAS);
     let gradLen = length(dpdx(in.st1));
     let scale = 1.0 / gradLen;
     let base = SDF_BASE_DEV
@@ -410,6 +553,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let range = SDF_AA_FACTOR * gradLen;
     let alpha = smoothstep(base - range, base + range, distance);
     return (alpha * opacity) * paint;
+#endif
+
+#ifdef EFFECT_CUSTOM
+    // VK ref Shader.frag EFFECT_CUSTOM: main_effect() * (opacity_ * paint.a)
+    return main_effect() * (opacity * paint.a);
 #endif
 
     return vec4<f32>(0.0);
@@ -455,9 +603,9 @@ fn fs_main(in: VsOut) -> FsLcdOut {
     // is the UV change per screen pixel in x; the R/G/B stripes sit at -1/3, 0,
     // +1/3 pixel.
     let duv = dpdx(in.uv1) * (1.0 / 3.0);
-    let dr = SDF_SCALE * (textureSample(paint_texture, paint_sampler, in.uv1 - duv).r - SDF_BIAS);
-    let dg = SDF_SCALE * (textureSample(paint_texture, paint_sampler, in.uv1).r - SDF_BIAS);
-    let db = SDF_SCALE * (textureSample(paint_texture, paint_sampler, in.uv1 + duv).r - SDF_BIAS);
+    let dr = SDF_SCALE * (textureSample(glyphs_texture, glyphs_sampler, in.uv1 - duv).r - SDF_BIAS);
+    let dg = SDF_SCALE * (textureSample(glyphs_texture, glyphs_sampler, in.uv1).r - SDF_BIAS);
+    let db = SDF_SCALE * (textureSample(glyphs_texture, glyphs_sampler, in.uv1 + duv).r - SDF_BIAS);
     let cov = vec3<f32>(
         smoothstep(base - range, base + range, dr),
         smoothstep(base - range, base + range, dg),
