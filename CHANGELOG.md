@@ -6,6 +6,8 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-02
+
 First release, on wgpu 29. The render device from `noesis_bevy` 0.15, as a
 crate of its own:
 
