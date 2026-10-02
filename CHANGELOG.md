@@ -6,6 +6,28 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- The `SDF_LINEAR`, `SDF_RADIAL` and `SDF_PATTERN*` shaders, so text draws
+  with gradient and image brushes.
+- Custom pixel shaders. `WgpuRenderDevice::create_pixel_shader` compiles WGSL
+  for a `BrushShader` or a `ShaderEffect` and returns a `PixelShaderHandle`;
+  `draw_custom_batch` draws a batch with it, taking extra textures and
+  constants in a `BatchShader`. With the `shim` feature, `draw_batch` reads
+  `batch.pixel_shader` as a handle. `drop_pixel_shader` releases one.
+- `WgpuRenderDevice::set_pattern_lod` sets a mip bias and a highest mip level
+  for images, as a `PatternLod`. The shaders apply it, so it needs no wgpu
+  feature.
+- `WgpuRenderDevice::import_texture` wraps a `wgpu::Texture` the host owns as
+  a texture Noesis can sample, without copying it.
+- MSAA render targets. A target created with more than one sample is 4x
+  multisampled, and `resolve_render_target` resolves it.
+
+### Changed
+
+- `draw_batch_with` skips a batch whose `pixel_shader` is set, counting it as
+  unsupported. Draw those with `draw_custom_batch`.
+
 ## [0.2.0] - 2026-10-02
 
 ### Changed

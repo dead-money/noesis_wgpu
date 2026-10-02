@@ -1,4 +1,4 @@
-//! [`WgpuRenderDevice`] and [`BatchTextures`].
+//! [`WgpuRenderDevice`], [`BatchTextures`] and [`PatternLod`].
 //!
 //! Each `begin_*_render` opens a command encoder that the matching
 //! `end_*_render` submits. Inside the offscreen phase, draws go to the render
@@ -22,6 +22,10 @@ use noesis_runtime::render_device::{
     TextureHandle, TextureRect,
 };
 
+use crate::custom_shader::{
+    BatchShader, MAX_SHADER_CONSTANTS, MAX_SHADER_TEXTURES, PixelShaderDesc, PixelShaderError,
+    PixelShaderHandle,
+};
 use crate::pipeline::{PipelineCache, PipelineKey, STENCIL_FORMAT};
 
 const DYNAMIC_VB_SIZE: u64 = 512 * 1024;
@@ -36,8 +40,14 @@ const VS_GLYPH_SIZE_OFFSET: usize = 64;
 // cbuffer0_ps: 8 floats.
 const PS_UNIFORM0_SIZE: u64 = 32;
 
-// First 8 floats of cbuffer1_ps (float[128] in the SDK); SHADOW reads 7, BLUR 1.
-const PS_UNIFORM1_SIZE: u64 = 32;
+// cbuffer1_ps, sized for a custom shader's largest `Constants`. The built-in
+// shaders read at most its first 8 floats (SHADOW 7, BLUR 1), so their draws
+// upload only those.
+const PS_UNIFORM1_SIZE: u64 = MAX_SHADER_CONSTANTS as u64;
+const PS_UNIFORM1_BUILTIN_SIZE: usize = 32;
+
+// `PatternLod` in noesis.wgsl: bias, max level, two pad floats.
+const PATTERN_LOD_SIZE: u64 = 16;
 
 // Initial `draw_batch_with` calls per render phase; the rings double past it.
 const UNIFORM_RING_SLOTS: u32 = 1024;
@@ -97,17 +107,14 @@ pub struct WgpuRenderDevice {
 
     uniforms: UniformRings,
 
-    // group(2) paint texture. Shaders without one bind `dummy_pattern_bg`.
-    pattern_bind_group_layout: wgpu::BindGroupLayout,
-    dummy_pattern_bg: wgpu::BindGroup,
+    // The texture bind groups: group(2) paint, or paint and extra textures
+    // for a custom shader, and group(3) image, shadow and glyphs. Unused slots
+    // get the dummy texture.
+    paint_layout: wgpu::BindGroupLayout,
+    custom_paint_layout: wgpu::BindGroupLayout,
+    image_layout: wgpu::BindGroupLayout,
     samplers: HashMap<SamplerState, wgpu::Sampler>,
-    pattern_bind_groups: HashMap<(TextureHandle, SamplerState), wgpu::BindGroup>,
-
-    // group(3) image (bindings 0/1) and shadow (2/3). Unused slots get the
-    // dummy texture.
-    image_bind_group_layout: wgpu::BindGroupLayout,
-    dummy_image_bg: wgpu::BindGroup,
-    image_bind_groups: HashMap<ImageBindGroupKey, wgpu::BindGroup>,
+    texture_groups: HashMap<TextureGroupKey, wgpu::BindGroup>,
 
     // 1x1 white; fills unused texture slots.
     #[allow(dead_code)] // owns the allocation behind `dummy_view`
@@ -118,6 +125,7 @@ pub struct WgpuRenderDevice {
     pipelines: PipelineCache,
     // Shaders already reported as unsupported.
     warned_shaders: HashSet<u8>,
+    warned_custom_shaders: HashSet<PixelShaderHandle>,
     // `pipelines` is filled in by `stats()`.
     stats: DeviceStats,
 
@@ -150,18 +158,44 @@ enum SkippedDraw {
     UnsupportedShader,
 }
 
-/// `(image, image sampler, shadow)`; a `None` shadow binds the dummy texture.
-type ImageBindGroupKey = (
-    TextureHandle,
-    SamplerState,
-    Option<(TextureHandle, SamplerState)>,
-);
+/// A texture and the sampler state to read it with, or `None` for the dummy.
+type TextureSlot = Option<(TextureHandle, SamplerState)>;
 
-#[allow(dead_code)] // width/height are never read
+/// The most texture slots in one bind group: a custom shader's paint and
+/// extra textures.
+const MAX_GROUP_SLOTS: usize = 1 + MAX_SHADER_TEXTURES;
+
+/// A texture bind group's layout and slots. Slots past the layout's count
+/// are `None`.
+type TextureGroupKey = (TextureGroup, [TextureSlot; MAX_GROUP_SLOTS]);
+
+/// The texture bind group layouts. Slot `i` takes bindings `2i` (texture) and
+/// `2i + 1` (sampler).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+enum TextureGroup {
+    /// group(2): the paint.
+    Paint,
+    /// group(2) of a custom shader: the paint, then the extra textures.
+    CustomPaint,
+    /// group(3): image, shadow, glyphs.
+    Image,
+}
+
+impl TextureGroup {
+    const fn slots(self) -> usize {
+        match self {
+            Self::Paint => 1,
+            Self::CustomPaint => MAX_GROUP_SLOTS,
+            Self::Image => 3,
+        }
+    }
+}
+
 struct GpuTexture {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
-    noesis_format: TextureFormat,
+    // `None` for a texture from `import_texture`, which `update_texture` skips.
+    noesis_format: Option<TextureFormat>,
     width: u32,
     height: u32,
     num_levels: u32,
@@ -175,16 +209,62 @@ struct GpuStencil {
     height: u32,
 }
 
-/// The resolve texture is a separate `textures` entry under `resolve_handle`,
-/// which Noesis releases through its own `drop_texture`.
+/// The resolve texture is a separate `textures` entry, which Noesis releases
+/// through its own `drop_texture`.
 struct GpuRenderTarget {
-    // Same texture as the resolve (sample_count is always 1).
+    // The view draws render into: the MSAA texture's, or the resolve
+    // texture's when the target is single-sampled.
     color_view: wgpu::TextureView,
-    #[allow(dead_code)] // records the resolve entry; never read
-    resolve_handle: TextureHandle,
+    // The resolve texture's view, for `resolve_render_target`.
+    resolve_view: wgpu::TextureView,
+    #[allow(dead_code)] // keeps the allocation alive behind `color_view`
+    msaa: Option<wgpu::Texture>,
     stencil: Option<(wgpu::Texture, wgpu::TextureView)>,
+    sample_count: u32,
     width: u32,
     height: u32,
+}
+
+/// The sample count of every MSAA render target: the one count above 1 that
+/// wgpu supports for `Rgba8Unorm` and `Stencil8` on every adapter.
+const MSAA_SAMPLE_COUNT: u32 = 4;
+
+/// How pattern textures pick their mip level, set with
+/// [`WgpuRenderDevice::set_pattern_lod`].
+///
+/// It applies to everything Noesis paints from a pattern, that is through an
+/// `ImageBrush`: images, opacity masks, pattern-filled text, and a brush
+/// shader's `sample_image`. wgpu samplers have no LOD bias, so the shaders
+/// apply it by scaling the texture coordinate derivatives; it costs no wgpu
+/// feature.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct PatternLod {
+    /// Added to the mip level the hardware would pick. Negative values pick
+    /// sharper, larger levels when an image is drawn smaller than its size.
+    pub bias: f32,
+    /// The highest (smallest) mip level sampled after the bias.
+    pub max_level: f32,
+}
+
+impl Default for PatternLod {
+    /// No bias and no limit: the levels the hardware picks.
+    fn default() -> Self {
+        Self {
+            bias: 0.0,
+            max_level: f32::MAX,
+        }
+    }
+}
+
+impl PatternLod {
+    fn to_bytes(self) -> [u8; PATTERN_LOD_SIZE as usize] {
+        // Past any real mip level, and finite for the shader.
+        let max_level = self.max_level.min(64.0);
+        let mut bytes = [0u8; PATTERN_LOD_SIZE as usize];
+        bytes[..4].copy_from_slice(&self.bias.to_le_bytes());
+        bytes[4..8].copy_from_slice(&max_level.to_le_bytes());
+        bytes
+    }
 }
 
 impl WgpuRenderDevice {
@@ -209,70 +289,15 @@ impl WgpuRenderDevice {
             wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         );
 
-        let uniforms = UniformRings::new(&device);
+        let uniforms = UniformRings::new(&device, &queue);
 
-        // Group(2): pattern texture + pattern sampler. Shared layout for
-        // both PAINT_PATTERN draws and the dummy used by non-pattern draws.
-        let pattern_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("noesis_wgpu pattern layout"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                ],
-            });
+        let paint_layout = texture_group_layout(&device, TextureGroup::Paint);
+        let custom_paint_layout = texture_group_layout(&device, TextureGroup::CustomPaint);
+        let image_layout = texture_group_layout(&device, TextureGroup::Image);
 
-        // Group(3): image texture+sampler (bindings 0/1) plus the shadow
-        // texture+sampler (bindings 2/3) co-bound for SHADOW / BLUR. Separate
-        // group from pattern so existing pipelines keep their group(2)-only
-        // setup; OPACITY-class shaders layer the offscreen image on top and
-        // leave the shadow slots dummy.
-        let texture_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
-            },
-            count: None,
-        };
-        let sampler_entry = |binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-            count: None,
-        };
-        let image_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("noesis_wgpu image+shadow layout"),
-                entries: &[
-                    texture_entry(0),
-                    sampler_entry(1),
-                    texture_entry(2),
-                    sampler_entry(3),
-                ],
-            });
-
-        // Dummy 1x1 white texture + default sampler for non-pattern draws.
-        // The pipeline layout always has group(2) so every draw must bind
-        // something; the shader just doesn't sample it.
+        // 1x1 white, bound to every texture slot a draw leaves empty.
         let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("noesis_wgpu dummy pattern"),
+            label: Some("noesis_wgpu dummy texture"),
             size: wgpu::Extent3d {
                 width: 1,
                 height: 1,
@@ -309,55 +334,25 @@ impl WgpuRenderDevice {
             label: Some("noesis_wgpu dummy sampler"),
             ..Default::default()
         });
-        let dummy_pattern_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu dummy pattern bg"),
-            layout: &pattern_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&dummy_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&dummy_sampler),
-                },
-            ],
-        });
-        let dummy_image_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu dummy image bg"),
-            layout: &image_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&dummy_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&dummy_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&dummy_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&dummy_sampler),
-                },
-            ],
-        });
 
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("noesis_wgpu pipeline layout"),
-            bind_group_layouts: &[
-                Some(&uniforms.vs_layout),
-                Some(&uniforms.ps_layout),
-                Some(&pattern_bind_group_layout),
-                Some(&image_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
-
-        let pipelines = PipelineCache::new(device.clone(), pipeline_layout, RT_COLOR_FORMAT);
+        let pipeline_layout = |label, paint_layout| {
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[
+                    Some(&uniforms.vs_layout),
+                    Some(&uniforms.ps_layout),
+                    Some(paint_layout),
+                    Some(&image_layout),
+                ],
+                immediate_size: 0,
+            })
+        };
+        let pipelines = PipelineCache::new(
+            device.clone(),
+            pipeline_layout("noesis_wgpu pipeline layout", &paint_layout),
+            pipeline_layout("noesis_wgpu custom pipeline layout", &custom_paint_layout),
+            RT_COLOR_FORMAT,
+        );
 
         Self {
             device,
@@ -365,18 +360,17 @@ impl WgpuRenderDevice {
             vertex_stream,
             index_stream,
             uniforms,
-            pattern_bind_group_layout,
-            dummy_pattern_bg,
+            paint_layout,
+            custom_paint_layout,
+            image_layout,
             samplers: HashMap::new(),
-            pattern_bind_groups: HashMap::new(),
-            image_bind_group_layout,
-            dummy_image_bg,
-            image_bind_groups: HashMap::new(),
+            texture_groups: HashMap::new(),
             dummy_texture,
             dummy_view,
             dummy_sampler,
             pipelines,
             warned_shaders: HashSet::new(),
+            warned_custom_shaders: HashSet::new(),
             stats: DeviceStats::default(),
             textures: HashMap::new(),
             render_targets: HashMap::new(),
@@ -392,90 +386,58 @@ impl WgpuRenderDevice {
         }
     }
 
-    /// Caches the group(2) bind group for `(handle, state)`; `drop_texture`
-    /// evicts it. `false` for an unknown handle.
-    fn ensure_pattern_bind_group(&mut self, handle: TextureHandle, state: SamplerState) -> bool {
-        if self.pattern_bind_groups.contains_key(&(handle, state)) {
+    /// Caches the bind group for `key`. `false` when a slot names an unknown
+    /// texture. `drop_texture` evicts the groups that sample a texture.
+    fn ensure_texture_group(&mut self, key: TextureGroupKey) -> bool {
+        if self.texture_groups.contains_key(&key) {
             return true;
         }
-        let Some(view) = self.textures.get(&handle).map(|t| &t.view) else {
-            return false;
-        };
-        let sampler = self
-            .samplers
-            .entry(state)
-            .or_insert_with(|| build_sampler(&self.device, state));
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu pattern bg"),
-            layout: &self.pattern_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(sampler),
-                },
-            ],
-        });
-        self.pattern_bind_groups.insert((handle, state), bg);
-        true
-    }
-
-    /// Caches the group(3) bind group for `key`; a `None` shadow binds the
-    /// dummy at 2/3. `false` for an unknown handle.
-    fn ensure_image_bind_group(&mut self, key: ImageBindGroupKey) -> bool {
-        let (image_handle, image_state, shadow) = key;
-        if self.image_bind_groups.contains_key(&key) {
-            return true;
-        }
-        let image = (image_handle, image_state);
-        self.samplers
-            .entry(image.1)
-            .or_insert_with(|| build_sampler(&self.device, image.1));
-        if let Some((_, sstate)) = shadow {
+        let (group, slots) = key;
+        let slots = &slots[..group.slots()];
+        for (_, state) in slots.iter().flatten() {
             self.samplers
-                .entry(sstate)
-                .or_insert_with(|| build_sampler(&self.device, sstate));
+                .entry(*state)
+                .or_insert_with(|| build_sampler(&self.device, *state));
         }
 
-        let Some(image_view) = self.textures.get(&image.0).map(|t| &t.view) else {
-            return false;
+        let mut resources = Vec::with_capacity(slots.len());
+        for slot in slots {
+            resources.push(match slot {
+                Some((handle, state)) => {
+                    let Some(texture) = self.textures.get(handle) else {
+                        return false;
+                    };
+                    (&texture.view, &self.samplers[state])
+                }
+                None => (&self.dummy_view, &self.dummy_sampler),
+            });
+        }
+        let entries: Vec<_> = (0u32..)
+            .zip(&resources)
+            .flat_map(|(i, (view, sampler))| {
+                [
+                    wgpu::BindGroupEntry {
+                        binding: 2 * i,
+                        resource: wgpu::BindingResource::TextureView(view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2 * i + 1,
+                        resource: wgpu::BindingResource::Sampler(sampler),
+                    },
+                ]
+            })
+            .collect();
+        let layout = match group {
+            TextureGroup::Paint => &self.paint_layout,
+            TextureGroup::CustomPaint => &self.custom_paint_layout,
+            TextureGroup::Image => &self.image_layout,
         };
-        let image_sampler = &self.samplers[&image.1];
-        let (shadow_view, shadow_sampler) = match shadow {
-            Some((handle, sstate)) => {
-                let Some(view) = self.textures.get(&handle).map(|t| &t.view) else {
-                    return false;
-                };
-                (view, &self.samplers[&sstate])
-            }
-            None => (&self.dummy_view, &self.dummy_sampler),
-        };
-        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("noesis_wgpu image+shadow bg"),
-            layout: &self.image_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(image_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(image_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(shadow_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(shadow_sampler),
-                },
-            ],
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("noesis_wgpu textures"),
+            layout,
+            entries: &entries,
         });
-        self.image_bind_groups.insert(key, bg);
+        self.texture_groups.insert(key, bind_group);
         true
     }
 
@@ -559,15 +521,48 @@ impl WgpuRenderDevice {
             .map(|rt| (rt.width, rt.height))
     }
 
+    /// Sets how pattern textures pick their mip level, for the draws of every
+    /// phase submitted afterwards. Call it between frames: the draws of a
+    /// phase in progress all see the last value set before it ends.
+    pub fn set_pattern_lod(&mut self, lod: PatternLod) {
+        self.queue
+            .write_buffer(&self.uniforms.pattern_lod, 0, &lod.to_bytes());
+    }
+
+    /// Compiles a custom pixel shader and returns its handle, for the batches
+    /// whose `pixel_shader` stands for it. See [`PixelShaderDesc`] for what
+    /// the WGSL can use and [`draw_custom_batch`](Self::draw_custom_batch)
+    /// for drawing with it.
+    ///
+    /// The shader is checked by building its pipeline for one representative
+    /// batch; other batch shaders and render states compile on first use. A
+    /// description out of range or WGSL that fails wgpu's validation returns
+    /// the error and registers nothing.
+    pub fn create_pixel_shader(
+        &mut self,
+        desc: PixelShaderDesc<'_>,
+    ) -> Result<PixelShaderHandle, PixelShaderError> {
+        let handle = PixelShaderHandle(self.alloc_handle());
+        self.pipelines.register_custom(handle, &desc)?;
+        Ok(handle)
+    }
+
+    /// Releases a custom pixel shader and its pipelines. Batches that still
+    /// name it are skipped with a warning.
+    pub fn drop_pixel_shader(&mut self, handle: PixelShaderHandle) {
+        self.pipelines.remove_custom(handle);
+        self.warned_custom_shaders.remove(&handle);
+    }
+
     fn alloc_handle(&mut self) -> NonZeroU64 {
         let h = self.next_handle;
         self.next_handle += 1;
         NonZeroU64::new(h).expect("alloc_handle starts at 1")
     }
 
-    /// Uploads `batch`'s uniforms and returns the `(vs, ps0, ps1)` dynamic
-    /// offsets.
-    fn upload_uniforms(&mut self, batch: &Batch) -> (u32, u32, u32) {
+    /// Uploads `batch`'s uniforms, with `ps1` in place of its `cbuffer1_ps`,
+    /// and returns the `(vs, ps0, ps1)` dynamic offsets.
+    fn upload_uniforms(&mut self, batch: &Batch, ps1: (&[u8], usize)) -> (u32, u32, u32) {
         let cbuf0 = batch.vertex_uniforms[0].as_bytes();
         let cbuf1 = batch.vertex_uniforms[1].as_bytes();
         let mut vs_buf = [0u8; VS_UNIFORM_SIZE as usize];
@@ -583,7 +578,7 @@ impl WgpuRenderDevice {
             &self.queue,
             &vs_buf,
             batch.pixel_uniforms[0].as_bytes(),
-            batch.pixel_uniforms[1].as_bytes(),
+            ps1,
         )
     }
 }
@@ -614,7 +609,7 @@ const fn align_up_u64(n: u64, align: u64) -> u64 {
 struct UniformRing {
     buffer: wgpu::Buffer,
     label: &'static str,
-    /// Bytes the shader actually reads from each slot.
+    /// Bytes the bind group exposes from each slot.
     struct_size: u64,
     /// Distance between slot starts: `struct_size` rounded up to
     /// `min_uniform_buffer_offset_alignment`.
@@ -666,30 +661,36 @@ impl UniformRing {
         self.next_slot = 0;
     }
 
-    /// Uploads `bytes` (truncated or zero-padded to `struct_size`) to the next
-    /// slot and returns its dynamic offset. The caller grows a full ring first.
-    fn write(&mut self, queue: &wgpu::Queue, bytes: &[u8]) -> u32 {
+    /// Uploads `bytes`, truncated or zero-padded to `len` bytes (a multiple of
+    /// 4, at most `struct_size`), to the start of the next slot and returns
+    /// its dynamic offset. The rest of the slot keeps stale data, so `len`
+    /// must cover what the shader reads. The caller grows a full ring first.
+    fn write(&mut self, queue: &wgpu::Queue, bytes: &[u8], len: usize) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;
         let offset = u64::from(slot) * self.slot_stride;
 
-        let len = bytes.len().min(self.struct_size as usize);
-        self.scratch[..len].copy_from_slice(&bytes[..len]);
-        self.scratch[len..].fill(0);
-        queue.write_buffer(&self.buffer, offset, &self.scratch);
+        let copied = bytes.len().min(len);
+        self.scratch[..copied].copy_from_slice(&bytes[..copied]);
+        self.scratch[copied..len].fill(0);
+        if len > 0 {
+            queue.write_buffer(&self.buffer, offset, &self.scratch[..len]);
+        }
 
         u32::try_from(offset).expect("uniform ring offset overflowed u32")
     }
 }
 
 /// The per-draw uniform rings and the bind groups that window them: group(0)
-/// holds the vertex uniforms, group(1) `cbuffer0_ps` at binding 0 and
-/// `cbuffer1_ps` at binding 1. The three rings fill in step, one slot per draw,
-/// and grow together.
+/// holds the vertex uniforms, group(1) `cbuffer0_ps` at binding 0,
+/// `cbuffer1_ps` at binding 1, and the [`PatternLod`] at binding 2, which
+/// isn't per draw. The three rings fill in step, one slot per draw, and grow
+/// together.
 struct UniformRings {
     vs: UniformRing,
     ps0: UniformRing,
     ps1: UniformRing,
+    pattern_lod: wgpu::Buffer,
     vs_layout: wgpu::BindGroupLayout,
     ps_layout: wgpu::BindGroupLayout,
     vs_bind_group: wgpu::BindGroup,
@@ -697,7 +698,7 @@ struct UniformRings {
 }
 
 impl UniformRings {
-    fn new(device: &wgpu::Device) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
         let vs = UniformRing::new(
             device,
             "noesis_wgpu vs_uniforms ring (mat4 projection)",
@@ -712,10 +713,17 @@ impl UniformRings {
         );
         let ps1 = UniformRing::new(
             device,
-            "noesis_wgpu ps_uniforms1 ring (cbuffer1_ps[8])",
+            "noesis_wgpu ps_uniforms1 ring (cbuffer1_ps)",
             PS_UNIFORM1_SIZE,
             UNIFORM_RING_SLOTS,
         );
+        let pattern_lod = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("noesis_wgpu pattern lod"),
+            size: PATTERN_LOD_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&pattern_lod, 0, &PatternLod::default().to_bytes());
 
         let uniform_entry = |binding, visibility, size| wgpu::BindGroupLayoutEntry {
             binding,
@@ -735,22 +743,33 @@ impl UniformRings {
                 VS_UNIFORM_SIZE,
             )],
         });
-        // cbuffer1_ps: only SHADOW / BLUR read it, but the shared layout always
-        // declares it so every pipeline matches.
+        // cbuffer1_ps and the pattern LOD: only some shaders read them, but the
+        // shared layout always declares them so every pipeline matches.
         let ps_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("noesis_wgpu ps_uniforms layout"),
             entries: &[
                 uniform_entry(0, wgpu::ShaderStages::FRAGMENT, PS_UNIFORM0_SIZE),
                 uniform_entry(1, wgpu::ShaderStages::FRAGMENT, PS_UNIFORM1_SIZE),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(PATTERN_LOD_SIZE),
+                    },
+                    count: None,
+                },
             ],
         });
 
         let vs_bind_group = vs_bind_group(device, &vs_layout, &vs);
-        let ps_bind_group = ps_bind_group(device, &ps_layout, &ps0, &ps1);
+        let ps_bind_group = ps_bind_group(device, &ps_layout, &ps0, &ps1, &pattern_lod);
         Self {
             vs,
             ps0,
             ps1,
+            pattern_lod,
             vs_layout,
             ps_layout,
             vs_bind_group,
@@ -765,26 +784,33 @@ impl UniformRings {
     }
 
     /// Uploads one draw's uniforms and returns the `(vs, ps0, ps1)` dynamic
-    /// offsets, doubling the rings first when they are full.
+    /// offsets, doubling the rings first when they are full. `ps1` is the
+    /// data and the length to upload.
     fn write(
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         vs: &[u8],
         ps0: &[u8],
-        ps1: &[u8],
+        ps1: (&[u8], usize),
     ) -> (u32, u32, u32) {
         if self.vs.is_full() {
             self.vs.grow(device);
             self.ps0.grow(device);
             self.ps1.grow(device);
             self.vs_bind_group = vs_bind_group(device, &self.vs_layout, &self.vs);
-            self.ps_bind_group = ps_bind_group(device, &self.ps_layout, &self.ps0, &self.ps1);
+            self.ps_bind_group = ps_bind_group(
+                device,
+                &self.ps_layout,
+                &self.ps0,
+                &self.ps1,
+                &self.pattern_lod,
+            );
         }
         (
-            self.vs.write(queue, vs),
-            self.ps0.write(queue, ps0),
-            self.ps1.write(queue, ps1),
+            self.vs.write(queue, vs, VS_UNIFORM_SIZE as usize),
+            self.ps0.write(queue, ps0, PS_UNIFORM0_SIZE as usize),
+            self.ps1.write(queue, ps1.0, ps1.1),
         )
     }
 }
@@ -819,6 +845,7 @@ fn ps_bind_group(
     layout: &wgpu::BindGroupLayout,
     ps0: &UniformRing,
     ps1: &UniformRing,
+    pattern_lod: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("noesis_wgpu ps_uniforms"),
@@ -832,7 +859,41 @@ fn ps_bind_group(
                 binding: 1,
                 resource: ring_binding(ps1),
             },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: pattern_lod.as_entire_binding(),
+            },
         ],
+    })
+}
+
+fn texture_group_layout(device: &wgpu::Device, group: TextureGroup) -> wgpu::BindGroupLayout {
+    let entries: Vec<_> = (0u32..)
+        .take(group.slots())
+        .flat_map(|i| {
+            [
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2 * i,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2 * i + 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ]
+        })
+        .collect();
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(&format!("noesis_wgpu {group:?} textures")),
+        entries: &entries,
     })
 }
 
@@ -975,8 +1036,14 @@ const fn shader_uses_paint_texture(shader: u8) -> bool {
         || shader == Shader::PATH_AA_LINEAR.0
         || shader == Shader::PATH_RADIAL.0
         || shader == Shader::PATH_AA_RADIAL.0
-        || shader == Shader::SDF_SOLID.0
-        || shader == Shader::SDF_LCD_SOLID.0
+        || shader == Shader::SDF_LINEAR.0
+        || shader == Shader::SDF_RADIAL.0
+        || shader == Shader::SDF_PATTERN.0
+        || shader == Shader::SDF_PATTERN_CLAMP.0
+        || shader == Shader::SDF_PATTERN_REPEAT.0
+        || shader == Shader::SDF_PATTERN_MIRROR_U.0
+        || shader == Shader::SDF_PATTERN_MIRROR_V.0
+        || shader == Shader::SDF_PATTERN_MIRROR.0
         || shader == Shader::OPACITY_LINEAR.0
         || shader == Shader::OPACITY_RADIAL.0
         || shader == Shader::OPACITY_PATTERN.0
@@ -985,14 +1052,16 @@ const fn shader_uses_paint_texture(shader: u8) -> bool {
         || shader == Shader::OPACITY_PATTERN_MIRROR_U.0
         || shader == Shader::OPACITY_PATTERN_MIRROR_V.0
         || shader == Shader::OPACITY_PATTERN_MIRROR.0
-        // DOWNSAMPLE/UPSAMPLE read the source image at group(2) `pattern`.
+        // DOWNSAMPLE/UPSAMPLE read the source image at group(2) `pattern`, as
+        // a custom effect reads its input.
         || shader == Shader::DOWNSAMPLE.0
         || shader == Shader::UPSAMPLE.0
+        || shader == Shader::CUSTOM_EFFECT.0
 }
 
-/// The batch slot (pattern, ramps, or glyphs) bound at group(2) for
-/// `batch`'s shader. `None` for shaders without a paint texture, or when
-/// Noesis left the slot empty.
+/// The batch slot (pattern or ramps) bound at group(2) for `batch`'s shader.
+/// `None` for shaders without a paint texture, or when Noesis left the slot
+/// empty.
 fn batch_paint_texture(
     batch: &Batch,
     textures: BatchTextures,
@@ -1010,6 +1079,12 @@ fn batch_paint_texture(
             || s == Shader::PATH_AA_PATTERN_MIRROR_V.0
             || s == Shader::PATH_PATTERN_MIRROR.0
             || s == Shader::PATH_AA_PATTERN_MIRROR.0
+            || s == Shader::SDF_PATTERN.0
+            || s == Shader::SDF_PATTERN_CLAMP.0
+            || s == Shader::SDF_PATTERN_REPEAT.0
+            || s == Shader::SDF_PATTERN_MIRROR_U.0
+            || s == Shader::SDF_PATTERN_MIRROR_V.0
+            || s == Shader::SDF_PATTERN_MIRROR.0
             || s == Shader::OPACITY_PATTERN.0
             || s == Shader::OPACITY_PATTERN_CLAMP.0
             || s == Shader::OPACITY_PATTERN_REPEAT.0
@@ -1023,15 +1098,17 @@ fn batch_paint_texture(
             || s == Shader::PATH_AA_LINEAR.0
             || s == Shader::PATH_RADIAL.0
             || s == Shader::PATH_AA_RADIAL.0
+            || s == Shader::SDF_LINEAR.0
+            || s == Shader::SDF_RADIAL.0
             || s == Shader::OPACITY_LINEAR.0
             || s == Shader::OPACITY_RADIAL.0 =>
         {
             textures.ramps.map(|h| (h, batch.ramps_sampler))
         }
-        s if s == Shader::SDF_SOLID.0 || s == Shader::SDF_LCD_SOLID.0 => {
-            textures.glyphs.map(|h| (h, batch.glyphs_sampler))
-        }
-        s if s == Shader::DOWNSAMPLE.0 || s == Shader::UPSAMPLE.0 => {
+        s if s == Shader::DOWNSAMPLE.0
+            || s == Shader::UPSAMPLE.0
+            || s == Shader::CUSTOM_EFFECT.0 =>
+        {
             textures.pattern.map(|h| (h, batch.pattern_sampler))
         }
         _ => None,
@@ -1058,6 +1135,12 @@ const fn shader_uses_image_texture(shader: u8) -> bool {
 /// True when `shader` also reads the group(3) `shadow` texture.
 const fn shader_uses_shadow_texture(shader: u8) -> bool {
     shader == Shader::SHADOW.0 || shader == Shader::BLUR.0
+}
+
+/// True when `shader` reads the group(3) `glyphs` texture: the SDF shaders
+/// `noesis.wgsl` implements. Must match `HAS_GLYPHS_TEXTURE`.
+const fn shader_uses_glyphs_texture(shader: u8) -> bool {
+    shader >= Shader::SDF_SOLID.0 && shader <= Shader::SDF_LCD_SOLID.0
 }
 
 fn wgpu_wrap_mode(wrap_raw: u8) -> wgpu::AddressMode {
@@ -1202,7 +1285,7 @@ impl WgpuRenderDevice {
             GpuTexture {
                 texture,
                 view,
-                noesis_format: desc.format,
+                noesis_format: Some(desc.format),
                 width: desc.width,
                 height: desc.height,
                 num_levels: desc.num_levels,
@@ -1221,8 +1304,9 @@ impl WgpuRenderDevice {
 
     /// Writes `data` into `rect` of mip `level`. `data` is tightly packed,
     /// with no row padding.
-    /// An unknown handle, a level the texture doesn't have, a rect outside the
-    /// level, or too little data logs a warning and writes nothing.
+    /// An unknown or imported texture, a level the texture doesn't have, a
+    /// rect outside the level, or too little data logs a warning and writes
+    /// nothing.
     pub fn update_texture(
         &mut self,
         handle: TextureHandle,
@@ -1232,6 +1316,10 @@ impl WgpuRenderDevice {
     ) {
         let Some(tex) = self.textures.get(&handle) else {
             warn!("update_texture: unknown texture {handle:?}");
+            return;
+        };
+        let Some(format) = tex.noesis_format else {
+            warn!("update_texture: {handle:?} is imported; the host writes it");
             return;
         };
         if level >= tex.num_levels {
@@ -1249,7 +1337,7 @@ impl WgpuRenderDevice {
             warn!("update_texture: rect {rect:?} outside level {level} ({level_w}x{level_h})");
             return;
         }
-        let bpp = bytes_per_pixel(tex.noesis_format);
+        let bpp = bytes_per_pixel(format);
         let needed = u64::from(rect.width) * u64::from(rect.height) * u64::from(bpp);
         if (data.len() as u64) < needed {
             warn!(
@@ -1289,32 +1377,120 @@ impl WgpuRenderDevice {
     /// wgpu orders the uploads before later passes on its own.
     pub fn end_updating_textures(&mut self, _textures: &[TextureHandle]) {}
 
-    /// Releases a texture and the bind groups that sample it.
+    /// Releases a texture and the bind groups that sample it. For an
+    /// imported texture, this releases the device's reference; the host's
+    /// stays valid.
     pub fn drop_texture(&mut self, handle: TextureHandle) {
         self.textures.remove(&handle);
-        self.pattern_bind_groups.retain(|(h, _), _| *h != handle);
-        self.image_bind_groups.retain(|(img, _, shadow), _| {
-            *img != handle && shadow.is_none_or(|(s, _)| s != handle)
+        self.texture_groups.retain(|(_, slots), _| {
+            !slots
+                .iter()
+                .flatten()
+                .any(|(texture, _)| *texture == handle)
         });
     }
 
-    /// Creates an `Rgba8Unorm` render target, with a `Stencil8` buffer when
-    /// `desc.needs_stencil` is set. Its color texture doubles as the resolve
-    /// texture Noesis samples.
+    /// Wraps a texture the host owns, such as a render target it draws into
+    /// every frame, as a [`TextureHandle`] Noesis can sample. Nothing is
+    /// copied: draws sample whatever the texture holds when the phase that
+    /// draws them is submitted.
     ///
-    /// MSAA isn't supported: any `desc.sample_count` gets a single-sampled
-    /// target, with a one-time warning.
+    /// The host wraps the returned binding in a Noesis texture object of its
+    /// own, as for [`create_texture`](Self::create_texture). Then:
+    ///
+    /// - Submit writes to the texture on this device's queue before the
+    ///   `end_*_render` whose draws should see them. Writes submitted later
+    ///   show from the next frame.
+    /// - The device holds its own reference until
+    ///   [`drop_texture`](Self::drop_texture), so the texture stays valid
+    ///   while Noesis uses it even if the host drops its copy. Don't call
+    ///   `wgpu::Texture::destroy` on it before then.
+    /// - [`update_texture`](Self::update_texture) skips it: the host writes it.
+    ///
+    /// The texture must be a single-layer, single-sampled 2D texture with
+    /// `TEXTURE_BINDING` usage and a filterable float format, such as
+    /// `Rgba8Unorm`. Its color is read as premultiplied alpha, like every
+    /// Noesis texture. Any other texture logs a warning and returns `None`.
+    pub fn import_texture(&mut self, texture: &wgpu::Texture) -> Option<TextureBinding> {
+        let filterable = matches!(
+            texture
+                .format()
+                .sample_type(None, Some(self.device.features())),
+            Some(wgpu::TextureSampleType::Float { filterable: true })
+        );
+        if texture.dimension() != wgpu::TextureDimension::D2
+            || texture.depth_or_array_layers() != 1
+            || texture.sample_count() != 1
+            || !texture
+                .usage()
+                .contains(wgpu::TextureUsages::TEXTURE_BINDING)
+            || !filterable
+        {
+            warn!(
+                "import_texture: a {:?} {:?} texture with {} layers, {} samples and {:?} \
+                 can't be sampled by Noesis",
+                texture.format(),
+                texture.dimension(),
+                texture.depth_or_array_layers(),
+                texture.sample_count(),
+                texture.usage(),
+            );
+            return None;
+        }
+
+        let handle = TextureHandle(self.alloc_handle());
+        let (width, height, num_levels) =
+            (texture.width(), texture.height(), texture.mip_level_count());
+        self.textures.insert(
+            handle,
+            GpuTexture {
+                texture: texture.clone(),
+                view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+                noesis_format: None,
+                width,
+                height,
+                num_levels,
+            },
+        );
+        Some(TextureBinding {
+            handle,
+            width,
+            height,
+            has_mipmaps: num_levels > 1,
+            inverted: false,
+            has_alpha: true,
+        })
+    }
+
+    /// Creates an `Rgba8Unorm` render target, with a `Stencil8` buffer when
+    /// `desc.needs_stencil` is set.
+    ///
+    /// A `desc.sample_count` above 1 gets a 4x MSAA target, the one count
+    /// every wgpu adapter supports, with a one-time warning when the request
+    /// was another count. Its draws render into a multisampled texture that
+    /// [`resolve_render_target`](Self::resolve_render_target) resolves into
+    /// the texture Noesis samples. A single-sampled target draws straight
+    /// into that texture.
     pub fn create_render_target(&mut self, desc: RenderTargetDesc<'_>) -> RenderTargetBinding {
-        if desc.sample_count != 1 {
+        let sample_count = if desc.sample_count > 1 {
+            MSAA_SAMPLE_COUNT
+        } else {
+            1
+        };
+        if desc.sample_count > 1 && desc.sample_count != MSAA_SAMPLE_COUNT {
             warn_once!(
-                "create_render_target: MSAA is unsupported; creating single-sampled targets \
-                 instead of {} samples",
+                "create_render_target: {} samples requested; MSAA targets use {MSAA_SAMPLE_COUNT}",
                 desc.sample_count,
             );
         }
 
         let rt_handle = RenderTargetHandle(self.alloc_handle());
         let resolve_handle = TextureHandle(self.alloc_handle());
+        let size = wgpu::Extent3d {
+            width: desc.width,
+            height: desc.height,
+            depth_or_array_layers: 1,
+        };
 
         let color_texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(desc.label),
@@ -1332,19 +1508,30 @@ impl WgpuRenderDevice {
                 | wgpu::TextureUsages::COPY_SRC,
             view_formats: &[],
         });
-        let color_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let resolve_view = color_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let msaa = (sample_count > 1).then(|| {
+            self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(&format!("{} msaa", desc.label)),
+                size,
+                mip_level_count: 1,
+                sample_count,
+                dimension: wgpu::TextureDimension::D2,
+                format: RT_COLOR_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            })
+        });
+        let color_view = msaa.as_ref().map_or_else(
+            || resolve_view.clone(),
+            |msaa| msaa.create_view(&wgpu::TextureViewDescriptor::default()),
+        );
 
         let stencil = desc.needs_stencil.then(|| {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(&format!("{} stencil", desc.label)),
-                size: wgpu::Extent3d {
-                    width: desc.width,
-                    height: desc.height,
-                    depth_or_array_layers: 1,
-                },
+                size,
                 mip_level_count: 1,
-                sample_count: 1,
+                sample_count,
                 dimension: wgpu::TextureDimension::D2,
                 format: RT_STENCIL_FORMAT,
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -1358,8 +1545,8 @@ impl WgpuRenderDevice {
             resolve_handle,
             GpuTexture {
                 texture: color_texture,
-                view: resolve_view,
-                noesis_format: TextureFormat::Rgba8,
+                view: resolve_view.clone(),
+                noesis_format: Some(TextureFormat::Rgba8),
                 width: desc.width,
                 height: desc.height,
                 num_levels: 1,
@@ -1369,8 +1556,10 @@ impl WgpuRenderDevice {
             rt_handle,
             GpuRenderTarget {
                 color_view,
-                resolve_handle,
+                resolve_view,
+                msaa,
                 stencil,
+                sample_count,
                 width: desc.width,
                 height: desc.height,
             },
@@ -1389,9 +1578,9 @@ impl WgpuRenderDevice {
         }
     }
 
-    /// Creates a render target with the size and stencil of `src`. Noesis
-    /// allows the two to share transient buffers; this device doesn't.
-    /// An unknown `src` logs a warning and gets a 1x1 target.
+    /// Creates a render target with the size, stencil and sample count of
+    /// `src`. Noesis allows the two to share transient buffers; this device
+    /// doesn't. An unknown `src` logs a warning and gets a 1x1 target.
     pub fn clone_render_target(
         &mut self,
         label: &str,
@@ -1399,20 +1588,20 @@ impl WgpuRenderDevice {
     ) -> RenderTargetBinding {
         // Noesis allows the clone to share src's transient buffers; a fresh RT
         // of the same size and stencil is a valid, unshared implementation.
-        let (width, height, needs_stencil) = match self.render_targets.get(&src) {
-            Some(src_rt) => (src_rt.width, src_rt.height, src_rt.stencil.is_some()),
+        let (width, height, sample_count, needs_stencil) = match self.render_targets.get(&src) {
+            Some(rt) => (rt.width, rt.height, rt.sample_count, rt.stencil.is_some()),
             None => {
                 warn!(
                     "clone_render_target '{label}': unknown source {src:?}; creating a 1x1 target"
                 );
-                (1, 1, false)
+                (1, 1, 1, false)
             }
         };
         self.create_render_target(RenderTargetDesc {
             label,
             width,
             height,
-            sample_count: 1,
+            sample_count,
             needs_stencil,
         })
     }
@@ -1544,10 +1733,38 @@ impl WgpuRenderDevice {
         self.current_tile = None;
     }
 
-    /// A no-op: render targets are single-sampled, so the color texture is
-    /// already the resolve texture.
-    pub fn resolve_render_target(&mut self, _handle: RenderTargetHandle, _tiles: &[Tile]) {
-        // sample_count is always 1: the color attachment is the resolve texture.
+    /// Resolves an MSAA render target into the texture Noesis samples. wgpu
+    /// resolves whole textures, so this resolves all of it, not just `tiles`;
+    /// Noesis only samples the tiles it drew. A no-op for a single-sampled
+    /// target, which draws straight into that texture.
+    pub fn resolve_render_target(&mut self, handle: RenderTargetHandle, _tiles: &[Tile]) {
+        let Some(rt) = self.render_targets.get(&handle) else {
+            warn!("resolve_render_target: unknown render target {handle:?}");
+            return;
+        };
+        if rt.sample_count == 1 {
+            return;
+        }
+        let Some(encoder) = self.encoder.as_mut() else {
+            warn!("resolve_render_target outside begin/end_offscreen_render; skipping");
+            return;
+        };
+        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("noesis_wgpu resolve"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &rt.color_view,
+                depth_slice: None,
+                resolve_target: Some(&rt.resolve_view),
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
     }
 
     /// Returns `bytes` bytes of vertex storage for Noesis to fill. The data
@@ -1579,12 +1796,41 @@ impl WgpuRenderDevice {
     /// cause) rather than a panic: one outside a phase or without a target,
     /// one whose shader needs a texture that `textures` leaves empty or names
     /// an unknown handle, one whose geometry runs past the mapped buffers, and
-    /// one whose shader this device doesn't implement (custom effects, the
-    /// `SDF_*` gradient and pattern paints, and most `SDF_LCD_*` variants).
+    /// one whose shader this device doesn't implement (`CUSTOM_EFFECT` and
+    /// most `SDF_LCD_*` variants). So is a batch with a custom pixel shader:
+    /// draw those with [`draw_custom_batch`](Self::draw_custom_batch).
     ///
     /// [`stats`](Self::stats) counts what was drawn and what was skipped.
     pub fn draw_batch_with(&mut self, batch: &Batch, textures: BatchTextures) {
-        match self.record_draw(batch, textures) {
+        if batch.pixel_shader.is_null() {
+            self.count_draw(batch, textures, None);
+        } else {
+            warn_once!("batch has a custom pixel shader; draw it with draw_custom_batch");
+            self.stats.unsupported_shader_draws += 1;
+        }
+    }
+
+    /// Draws `batch`, which has a custom pixel shader, with `shader`'s WGSL
+    /// in place of part of the batch's shader: the paint of a pattern shader
+    /// for a brush, the whole effect for `CUSTOM_EFFECT`. Everything else is
+    /// as in [`draw_batch_with`](Self::draw_batch_with), which ignores
+    /// `batch.pixel_shader` the way it ignores the texture pointers.
+    ///
+    /// Besides `draw_batch_with`'s reasons, the batch is skipped with a
+    /// warning when `shader.shader` is unknown, when the shader's kind can't
+    /// draw as the batch's shader or its WGSL fails there, or when
+    /// `shader.textures` lacks a texture the shader declared.
+    pub fn draw_custom_batch(
+        &mut self,
+        batch: &Batch,
+        textures: BatchTextures,
+        shader: BatchShader<'_>,
+    ) {
+        self.count_draw(batch, textures, Some(shader));
+    }
+
+    fn count_draw(&mut self, batch: &Batch, textures: BatchTextures, shader: Option<BatchShader>) {
+        match self.record_draw(batch, textures, shader) {
             Ok(()) => self.stats.draws += 1,
             Err(SkippedDraw::Protocol) => self.stats.dropped_draws += 1,
             Err(SkippedDraw::UnsupportedShader) => self.stats.unsupported_shader_draws += 1,
@@ -1592,15 +1838,20 @@ impl WgpuRenderDevice {
     }
 
     #[allow(clippy::too_many_lines)] // one pass of checks, then one render pass
-    fn record_draw(&mut self, batch: &Batch, textures: BatchTextures) -> Result<(), SkippedDraw> {
-        let (has_stencil, clear_stencil) = match self.phase {
+    fn record_draw(
+        &mut self,
+        batch: &Batch,
+        textures: BatchTextures,
+        custom: Option<BatchShader>,
+    ) -> Result<(), SkippedDraw> {
+        let (has_stencil, clear_stencil, sample_count) = match self.phase {
             FramePhase::Onscreen => {
                 if self.target_view.is_none() {
                     warn_once!("onscreen draw without set_onscreen_target; skipping");
                     return Err(SkippedDraw::Protocol);
                 }
                 let has = self.onscreen_stencil.is_some();
-                (has, has && !self.onscreen_stencil_cleared)
+                (has, has && !self.onscreen_stencil_cleared, 1)
             }
             FramePhase::Offscreen => {
                 let Some(rt) = self.current_rt.and_then(|h| self.render_targets.get(&h)) else {
@@ -1608,7 +1859,11 @@ impl WgpuRenderDevice {
                     return Err(SkippedDraw::Protocol);
                 };
                 let has = rt.stencil.is_some();
-                (has, has && !self.current_rt_stencil_cleared)
+                (
+                    has,
+                    has && !self.current_rt_stencil_cleared,
+                    rt.sample_count,
+                )
             }
             FramePhase::Idle => {
                 warn_once!("draw outside begin/end_*_render; skipping");
@@ -1616,52 +1871,99 @@ impl WgpuRenderDevice {
             }
         };
 
-        let Some(key) = PipelineKey::from_batch(batch, has_stencil) else {
+        // `(extra textures, constants size)` the custom shader declared.
+        let declared = match custom {
+            Some(custom) => {
+                let Some(shader) = self.pipelines.custom(custom.shader) else {
+                    self.warn_custom_shader(custom.shader, "isn't registered");
+                    return Err(SkippedDraw::UnsupportedShader);
+                };
+                Some((shader.textures as usize, shader.constants as usize))
+            }
+            // CUSTOM_EFFECT only draws through a custom shader.
+            None if batch.shader == Shader::CUSTOM_EFFECT => {
+                self.warn_unsupported_shader(batch.shader.0);
+                return Err(SkippedDraw::UnsupportedShader);
+            }
+            None => None,
+        };
+
+        let pixel_shader = custom.map(|custom| custom.shader);
+        let Some(key) = PipelineKey::from_batch(batch, has_stencil, sample_count, pixel_shader)
+        else {
             self.warn_unsupported_shader(batch.shader.0);
             return Err(SkippedDraw::UnsupportedShader);
         };
 
         // Build bind groups before borrowing `encoder` mutably.
-        let pattern_slot = if shader_uses_paint_texture(batch.shader.0) {
+        let shader = batch.shader.0;
+        let paint = if shader_uses_paint_texture(shader) {
             let Some(slot) = batch_paint_texture(batch, textures) else {
                 warn_once!("batch's shader samples a paint texture it wasn't given; skipping");
                 return Err(SkippedDraw::Protocol);
             };
-            if !self.ensure_pattern_bind_group(slot.0, slot.1) {
-                warn_once!("batch names an unknown paint texture; skipping");
-                return Err(SkippedDraw::Protocol);
-            }
             Some(slot)
         } else {
             None
         };
-
-        let image_slot: Option<ImageBindGroupKey> = if shader_uses_image_texture(batch.shader.0) {
-            let Some(image) = textures.image else {
-                warn_once!("batch's shader samples an image texture it wasn't given; skipping");
-                return Err(SkippedDraw::Protocol);
-            };
-            let shadow = if shader_uses_shadow_texture(batch.shader.0) {
-                let Some(shadow) = textures.shadow else {
-                    warn_once!("batch's shader samples a shadow texture it wasn't given; skipping");
+        let mut paint_slots = [None; MAX_GROUP_SLOTS];
+        paint_slots[0] = paint;
+        let paint_key = match (custom, declared) {
+            (Some(custom), Some((declared_textures, _))) => {
+                if custom.textures[..declared_textures].contains(&None) {
+                    warn_once!("custom shader draw lacks an extra texture it declared; skipping");
                     return Err(SkippedDraw::Protocol);
-                };
-                Some((shadow, batch.shadow_sampler))
-            } else {
-                None
-            };
-            let key = (image, batch.image_sampler, shadow);
-            if !self.ensure_image_bind_group(key) {
-                warn_once!("batch names an unknown image or shadow texture; skipping");
-                return Err(SkippedDraw::Protocol);
+                }
+                paint_slots[1..].copy_from_slice(&custom.textures);
+                (TextureGroup::CustomPaint, paint_slots)
             }
-            Some(key)
-        } else {
-            None
+            _ => (TextureGroup::Paint, paint_slots),
         };
 
+        let image_slot = |uses: bool, texture: Option<TextureHandle>, sampler| {
+            if !uses {
+                return Ok(None);
+            }
+            texture
+                .map(|t| Some((t, sampler)))
+                .ok_or(SkippedDraw::Protocol)
+        };
+        let (Ok(image), Ok(shadow), Ok(glyphs)) = (
+            image_slot(
+                shader_uses_image_texture(shader),
+                textures.image,
+                batch.image_sampler,
+            ),
+            image_slot(
+                shader_uses_shadow_texture(shader),
+                textures.shadow,
+                batch.shadow_sampler,
+            ),
+            image_slot(
+                shader_uses_glyphs_texture(shader),
+                textures.glyphs,
+                batch.glyphs_sampler,
+            ),
+        ) else {
+            warn_once!(
+                "batch's shader samples an image, shadow or glyph texture it wasn't given; \
+                 skipping"
+            );
+            return Err(SkippedDraw::Protocol);
+        };
+        let image_key = (TextureGroup::Image, [image, shadow, glyphs, None, None]);
+
+        if !self.ensure_texture_group(paint_key) || !self.ensure_texture_group(image_key) {
+            warn_once!("batch names an unknown texture; skipping");
+            return Err(SkippedDraw::Protocol);
+        }
+
         if !self.pipelines.ensure(key) {
-            self.warn_unsupported_shader(batch.shader.0);
+            match pixel_shader {
+                Some(handle) => self
+                    .warn_custom_shader(handle, &format!("can't draw as Noesis shader {shader}")),
+                None => self.warn_unsupported_shader(shader),
+            }
             return Err(SkippedDraw::UnsupportedShader);
         }
 
@@ -1678,7 +1980,16 @@ impl WgpuRenderDevice {
             return Err(SkippedDraw::Protocol);
         }
 
-        let (vs_offset, ps_offset, ps1_offset) = self.upload_uniforms(batch);
+        let ps1 = match (custom, declared) {
+            (Some(custom), Some((_, constants))) => (
+                custom
+                    .constants
+                    .unwrap_or_else(|| batch.pixel_uniforms[1].as_bytes()),
+                constants.next_multiple_of(16),
+            ),
+            _ => (batch.pixel_uniforms[1].as_bytes(), PS_UNIFORM1_BUILTIN_SIZE),
+        };
+        let (vs_offset, ps_offset, ps1_offset) = self.upload_uniforms(batch, ps1);
 
         let (target_view, scissor, stencil_view) = if self.phase == FramePhase::Offscreen {
             let Some(rt) = self.current_rt.and_then(|h| self.render_targets.get(&h)) else {
@@ -1704,14 +2015,8 @@ impl WgpuRenderDevice {
         let index_buffer = self.index_stream.buffer();
         let vs_bg = &self.uniforms.vs_bind_group;
         let ps_bg = &self.uniforms.ps_bind_group;
-        let pattern_bg = match pattern_slot {
-            Some(slot) => &self.pattern_bind_groups[&slot],
-            None => &self.dummy_pattern_bg,
-        };
-        let image_bg = match image_slot {
-            Some(slot) => &self.image_bind_groups[&slot],
-            None => &self.dummy_image_bg,
-        };
+        let paint_bg = &self.texture_groups[&paint_key];
+        let image_bg = &self.texture_groups[&image_key];
         let Some(encoder) = self.encoder.as_mut() else {
             warn_once!("draw with no open command encoder; skipping");
             return Err(SkippedDraw::Protocol);
@@ -1754,7 +2059,7 @@ impl WgpuRenderDevice {
         }
         rpass.set_bind_group(0, vs_bg, &[vs_offset]);
         rpass.set_bind_group(1, ps_bg, &[ps_offset, ps1_offset]);
-        rpass.set_bind_group(2, pattern_bg, &[]);
+        rpass.set_bind_group(2, paint_bg, &[]);
         rpass.set_bind_group(3, image_bg, &[]);
         if let Some((x, y, w, h)) = scissor {
             rpass.set_scissor_rect(x, y, w, h);
@@ -1777,6 +2082,13 @@ impl WgpuRenderDevice {
             warn!("Noesis shader {shader} isn't implemented; skipping its batches");
         }
     }
+
+    /// Warns once per custom shader that its batches are skipped.
+    fn warn_custom_shader(&mut self, handle: PixelShaderHandle, why: &str) {
+        if self.warned_custom_shaders.insert(handle) {
+            warn!("custom shader {handle:?} {why}; skipping its batches");
+        }
+    }
 }
 
 /// What a [`WgpuRenderDevice`] has drawn, from [`WgpuRenderDevice::stats`].
@@ -1789,14 +2101,16 @@ pub struct DeviceStats {
     /// Batches drawn.
     pub draws: u64,
     /// Batches skipped because a call broke the render-device protocol: a draw
-    /// outside a phase or without a target, a texture the batch's shader needs
-    /// but didn't get, an unknown handle, or geometry past the mapped buffers.
+    /// outside a phase or without a target, a texture the batch's shader
+    /// (or custom shader) needs but didn't get, an unknown texture handle, or
+    /// geometry past the mapped buffers.
     pub dropped_draws: u64,
-    /// Batches skipped because the device has no variant of their shader,
-    /// such as a custom effect.
+    /// Batches skipped because the device can't draw their shader: one it has
+    /// no variant of, a custom shader that is unknown or can't draw as the
+    /// batch's shader, or a custom batch passed to `draw_batch_with`.
     pub unsupported_shader_draws: u64,
-    /// Render pipelines compiled so far, one per shader, render state, vertex
-    /// format and stencil combination drawn.
+    /// Render pipelines compiled so far, one per shader, custom shader, render
+    /// state, and target stencil and sample count drawn.
     pub pipelines: usize,
 }
 
@@ -1859,7 +2173,8 @@ impl BatchTextures {
 /// Lets `noesis_runtime`'s shim drive the device: pass it to
 /// [`noesis_runtime::render_device::register`]. Each method forwards to the
 /// inherent method of the same name, and `draw_batch` reads the batch's
-/// textures with [`BatchTextures::from_batch`].
+/// textures with [`BatchTextures::from_batch`] and its custom shader, if any,
+/// with [`BatchShader::from_batch`].
 #[cfg(feature = "shim")]
 impl RenderDevice for WgpuRenderDevice {
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
@@ -1953,6 +2268,10 @@ impl RenderDevice for WgpuRenderDevice {
     }
 
     fn draw_batch(&mut self, batch: &Batch) {
-        self.draw_batch_with(batch, BatchTextures::from_batch(batch));
+        let textures = BatchTextures::from_batch(batch);
+        match BatchShader::from_batch(batch) {
+            Some(shader) => self.draw_custom_batch(batch, textures, shader),
+            None => self.draw_batch_with(batch, textures),
+        }
     }
 }

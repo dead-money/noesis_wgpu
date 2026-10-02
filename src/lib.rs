@@ -33,6 +33,17 @@
 //! for. It passes them to [`WgpuRenderDevice::draw_batch_with`] as
 //! [`BatchTextures`].
 //!
+//! # Beyond the protocol
+//!
+//! - Custom shaders: [`WgpuRenderDevice::create_pixel_shader`] compiles WGSL
+//!   for Noesis's `BrushShader` and `ShaderEffect` objects, and
+//!   [`WgpuRenderDevice::draw_custom_batch`] draws a batch with one, given as
+//!   a [`BatchShader`].
+//! - [`WgpuRenderDevice::import_texture`] wraps a `wgpu::Texture` the host
+//!   owns, such as a live render target, as a texture Noesis can sample.
+//! - [`WgpuRenderDevice::set_pattern_lod`] biases and caps the mip level of
+//!   images, as a [`PatternLod`].
+//!
 //! # Features
 //!
 //! - `shim` (default): implements `noesis_runtime`'s `RenderDevice` trait and
@@ -47,10 +58,15 @@ macro_rules! warn_once {
     }};
 }
 
+mod custom_shader;
 mod device;
 mod pipeline;
 mod shader_defines;
 mod shader_preproc;
 mod vertex_layout;
 
-pub use device::{BatchTextures, DeviceStats, WgpuRenderDevice};
+pub use custom_shader::{
+    BatchShader, MAX_SHADER_CONSTANTS, MAX_SHADER_TEXTURES, PixelShaderDesc, PixelShaderError,
+    PixelShaderHandle, PixelShaderKind,
+};
+pub use device::{BatchTextures, DeviceStats, PatternLod, WgpuRenderDevice};
