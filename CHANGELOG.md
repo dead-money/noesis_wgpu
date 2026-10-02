@@ -19,4 +19,5 @@ crate of its own:
 - Fixed: mapping more geometry than the stream's staging buffer held, with a
   length that isn't a multiple of 4, no longer panics at unmap.
 
-[Unreleased]: https://github.com/dead-money/noesis_wgpu/commits/main
+[Unreleased]: https://github.com/dead-money/noesis_wgpu/compare/v0.1.0...release/0.1
+[0.1.0]: https://github.com/dead-money/noesis_wgpu/releases/tag/v0.1.0
