@@ -6,6 +6,8 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-02
+
 ### Added
 
 - The `SDF_LINEAR`, `SDF_RADIAL` and `SDF_PATTERN*` shaders, so text draws
