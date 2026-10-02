@@ -29,7 +29,7 @@ pre-1.0, any `0.x` release may contain breaking changes.
 - A render phase is no longer limited to 1024 draws. The per-draw uniform rings
   double when they fill instead of panicking.
 
-## [0.1.0]
+## [0.1.0] - 2026-10-02
 
 First release, on wgpu 29. The render device from `noesis_bevy` 0.15, as a
 crate of its own:
@@ -44,4 +44,6 @@ crate of its own:
 - Fixed: mapping more geometry than the stream's staging buffer held, with a
   length that isn't a multiple of 4, no longer panics at unmap.
 
-[Unreleased]: https://github.com/dead-money/noesis_wgpu/commits/main
+[Unreleased]: https://github.com/dead-money/noesis_wgpu/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/dead-money/noesis_wgpu/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/dead-money/noesis_wgpu/releases/tag/v0.1.0
