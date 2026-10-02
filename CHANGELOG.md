@@ -6,6 +6,8 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-02
+
 ### Changed
 
 - **Breaking:** moved to wgpu 30. The 0.1 line stays on wgpu 29 for Bevy 0.19.
