@@ -9,6 +9,7 @@ mod wgpu_import_texture;
 mod wgpu_msaa;
 mod wgpu_multi_shader;
 mod wgpu_offscreen_rt;
+mod wgpu_pass_reuse;
 mod wgpu_pattern;
 mod wgpu_pattern_lod;
 mod wgpu_pattern_wrap;

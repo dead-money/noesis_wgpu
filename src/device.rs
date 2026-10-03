@@ -142,11 +142,31 @@ pub struct WgpuRenderDevice {
     current_rt_stencil_cleared: bool,
 
     phase: FramePhase,
+    // Declared before `encoder`: the pass locks the encoder until it drops.
+    pass: Option<OpenPass>,
     encoder: Option<wgpu::CommandEncoder>,
     current_rt: Option<RenderTargetHandle>,
     current_tile: Option<Tile>,
 
     next_handle: u64,
+}
+
+/// The attachments a render pass draws into.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum PassTarget {
+    Onscreen,
+    Offscreen(RenderTargetHandle),
+}
+
+/// The render pass the last draw recorded into. Draws into the same target
+/// share it, so a phase records one pass per run of draws into one target
+/// instead of one per draw.
+struct OpenPass {
+    pass: wgpu::RenderPass<'static>,
+    target: PassTarget,
+    /// The scissor rect last set in the pass; `None` while it covers the
+    /// whole target.
+    scissor: Option<(u32, u32, u32, u32)>,
 }
 
 /// Why [`WgpuRenderDevice::draw_batch_with`] skipped a batch.
@@ -379,6 +399,7 @@ impl WgpuRenderDevice {
             onscreen_stencil_cleared: false,
             current_rt_stencil_cleared: false,
             phase: FramePhase::Idle,
+            pass: None,
             encoder: None,
             current_rt: None,
             current_tile: None,
@@ -491,6 +512,7 @@ impl WgpuRenderDevice {
             });
             self.onscreen_stencil_cleared = false;
         }
+        self.pass = None;
         self.target_view = Some(view);
     }
 
@@ -603,9 +625,10 @@ const fn align_up_u64(n: u64, align: u64) -> u64 {
 
 /// One uniform buffer split into slots, one per draw. The bind group covers
 /// one slot at offset 0 and the dynamic offset selects the slot.
-/// `write_buffer` calls all land before the phase's submit, so a shared slot
-/// would leave every draw reading the last batch's values. Reset at each
-/// `begin_*_render`.
+/// The upload lands before the phase's submit, so a shared slot would leave
+/// every draw reading the last batch's values. Draws write their slots into a
+/// CPU copy, and `flush` uploads the slots written since the last flush in one
+/// `write_buffer`. Reset at each `begin_*_render`.
 struct UniformRing {
     buffer: wgpu::Buffer,
     label: &'static str,
@@ -616,8 +639,10 @@ struct UniformRing {
     slot_stride: u64,
     slot_capacity: u32,
     next_slot: u32,
-    /// Zero-padded copy of the payload so a short payload still fills the slot.
-    scratch: Vec<u8>,
+    /// The first slot `flush` has not uploaded.
+    flushed_slot: u32,
+    /// The CPU copy of the buffer's slots.
+    staged: Vec<u8>,
 }
 
 impl UniformRing {
@@ -642,7 +667,8 @@ impl UniformRing {
             slot_stride,
             slot_capacity,
             next_slot: 0,
-            scratch: vec![0u8; struct_size as usize],
+            flushed_slot: 0,
+            staged: vec![0u8; (slot_stride * u64::from(slot_capacity)) as usize],
         }
     }
 
@@ -652,30 +678,45 @@ impl UniformRing {
 
     /// Replaces the buffer with an empty one of twice the slots. Draws already
     /// recorded keep the old buffer alive through the encoder, so nothing is
-    /// copied.
+    /// copied. Flush first, or the old buffer misses its last writes.
     fn grow(&mut self, device: &wgpu::Device) {
         *self = Self::new(device, self.label, self.struct_size, self.slot_capacity * 2);
     }
 
     fn reset(&mut self) {
         self.next_slot = 0;
+        self.flushed_slot = 0;
     }
 
-    /// Uploads `bytes`, truncated or zero-padded to `len` bytes (a multiple of
-    /// 4, at most `struct_size`), to the start of the next slot and returns
-    /// its dynamic offset. The rest of the slot keeps stale data, so `len`
-    /// must cover what the shader reads. The caller grows a full ring first.
-    fn write(&mut self, queue: &wgpu::Queue, bytes: &[u8], len: usize) -> u32 {
+    /// Uploads the slots written since the last flush.
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        if self.next_slot == self.flushed_slot {
+            return;
+        }
+        let start = u64::from(self.flushed_slot) * self.slot_stride;
+        let end = u64::from(self.next_slot) * self.slot_stride;
+        queue.write_buffer(
+            &self.buffer,
+            start,
+            &self.staged[start as usize..end as usize],
+        );
+        self.flushed_slot = self.next_slot;
+    }
+
+    /// Stages `bytes`, truncated or zero-padded to `len` bytes (a multiple of
+    /// 4, at most `struct_size`), at the start of the next slot and returns
+    /// its dynamic offset; `flush` uploads it. The rest of the slot keeps
+    /// stale data, so `len` must cover what the shader reads. The caller grows
+    /// a full ring first.
+    fn write(&mut self, bytes: &[u8], len: usize) -> u32 {
         let slot = self.next_slot;
         self.next_slot += 1;
         let offset = u64::from(slot) * self.slot_stride;
 
+        let start = offset as usize;
         let copied = bytes.len().min(len);
-        self.scratch[..copied].copy_from_slice(&bytes[..copied]);
-        self.scratch[copied..len].fill(0);
-        if len > 0 {
-            queue.write_buffer(&self.buffer, offset, &self.scratch[..len]);
-        }
+        self.staged[start..start + copied].copy_from_slice(&bytes[..copied]);
+        self.staged[start + copied..start + len].fill(0);
 
         u32::try_from(offset).expect("uniform ring offset overflowed u32")
     }
@@ -783,9 +824,17 @@ impl UniformRings {
         self.ps1.reset();
     }
 
-    /// Uploads one draw's uniforms and returns the `(vs, ps0, ps1)` dynamic
+    /// Uploads the draws' uniforms written since the last flush. Call it
+    /// before the phase's encoder is submitted.
+    fn flush(&mut self, queue: &wgpu::Queue) {
+        self.vs.flush(queue);
+        self.ps0.flush(queue);
+        self.ps1.flush(queue);
+    }
+
+    /// Stages one draw's uniforms and returns the `(vs, ps0, ps1)` dynamic
     /// offsets, doubling the rings first when they are full. `ps1` is the
-    /// data and the length to upload.
+    /// data and the length to stage. `flush` uploads them.
     fn write(
         &mut self,
         device: &wgpu::Device,
@@ -795,6 +844,7 @@ impl UniformRings {
         ps1: (&[u8], usize),
     ) -> (u32, u32, u32) {
         if self.vs.is_full() {
+            self.flush(queue);
             self.vs.grow(device);
             self.ps0.grow(device);
             self.ps1.grow(device);
@@ -808,9 +858,9 @@ impl UniformRings {
             );
         }
         (
-            self.vs.write(queue, vs, VS_UNIFORM_SIZE as usize),
-            self.ps0.write(queue, ps0, PS_UNIFORM0_SIZE as usize),
-            self.ps1.write(queue, ps1.0, ps1.1),
+            self.vs.write(vs, VS_UNIFORM_SIZE as usize),
+            self.ps0.write(ps0, PS_UNIFORM0_SIZE as usize),
+            self.ps1.write(ps1.0, ps1.1),
         )
     }
 }
@@ -1625,6 +1675,7 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
+        self.pass = None;
         self.uniforms.reset();
         self.vertex_stream.reset();
         self.index_stream.reset();
@@ -1648,6 +1699,8 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
+        self.pass = None;
+        self.uniforms.flush(&self.queue);
         if let Some(encoder) = self.encoder.take() {
             self.queue.submit(Some(encoder.finish()));
         }
@@ -1667,6 +1720,7 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
+        self.pass = None;
         self.uniforms.reset();
         self.vertex_stream.reset();
         self.index_stream.reset();
@@ -1689,6 +1743,8 @@ impl WgpuRenderDevice {
                 self.phase,
             );
         }
+        self.pass = None;
+        self.uniforms.flush(&self.queue);
         if let Some(encoder) = self.encoder.take() {
             self.queue.submit(Some(encoder.finish()));
         }
@@ -1700,6 +1756,7 @@ impl WgpuRenderDevice {
     /// An unknown handle logs a warning, and offscreen draws skip until the
     /// next call.
     pub fn set_render_target(&mut self, handle: RenderTargetHandle) {
+        self.pass = None;
         if self.phase != FramePhase::Offscreen {
             warn!("set_render_target called in the {:?} phase", self.phase);
         }
@@ -1745,6 +1802,7 @@ impl WgpuRenderDevice {
         if rt.sample_count == 1 {
             return;
         }
+        self.pass = None;
         let Some(encoder) = self.encoder.as_mut() else {
             warn!("resolve_render_target outside begin/end_offscreen_render; skipping");
             return;
@@ -1790,7 +1848,8 @@ impl WgpuRenderDevice {
     /// The batch's own texture pointers are ignored; its samplers, uniforms,
     /// shader and render state are used as given. A draw goes to the current
     /// render target and tile in the offscreen phase, and to the onscreen
-    /// target in the onscreen phase. Each draw records its own render pass.
+    /// target in the onscreen phase. Consecutive draws into one target share a
+    /// render pass.
     ///
     /// A batch that can't be drawn is skipped with a warning (logged once per
     /// cause) rather than a panic: one outside a phase or without a target,
@@ -1991,24 +2050,35 @@ impl WgpuRenderDevice {
         };
         let (vs_offset, ps_offset, ps1_offset) = self.upload_uniforms(batch, ps1);
 
-        let (target_view, scissor, stencil_view) = if self.phase == FramePhase::Offscreen {
-            let Some(rt) = self.current_rt.and_then(|h| self.render_targets.get(&h)) else {
-                return Err(SkippedDraw::Protocol);
+        let (target, target_view, scissor, full, stencil_view) =
+            if self.phase == FramePhase::Offscreen {
+                let Some(handle) = self.current_rt else {
+                    return Err(SkippedDraw::Protocol);
+                };
+                let Some(rt) = self.render_targets.get(&handle) else {
+                    return Err(SkippedDraw::Protocol);
+                };
+                self.current_rt_stencil_cleared = true;
+                let scissor = self
+                    .current_tile
+                    .map(|t| tile_scissor(t, rt.width, rt.height));
+                let stencil = rt.stencil.as_ref().map(|(_, view)| view);
+                (
+                    PassTarget::Offscreen(handle),
+                    &rt.color_view,
+                    scissor,
+                    (0, 0, rt.width, rt.height),
+                    stencil,
+                )
+            } else {
+                self.onscreen_stencil_cleared = true;
+                let Some(view) = self.target_view.as_ref() else {
+                    return Err(SkippedDraw::Protocol);
+                };
+                let stencil = self.onscreen_stencil.as_ref().map(|s| &s.view);
+                // Onscreen draws never set a scissor, so the full rect is not needed.
+                (PassTarget::Onscreen, view, None, (0, 0, 0, 0), stencil)
             };
-            self.current_rt_stencil_cleared = true;
-            let scissor = self
-                .current_tile
-                .map(|t| tile_scissor(t, rt.width, rt.height));
-            let stencil = rt.stencil.as_ref().map(|(_, view)| view);
-            (&rt.color_view, scissor, stencil)
-        } else {
-            self.onscreen_stencil_cleared = true;
-            let Some(view) = self.target_view.as_ref() else {
-                return Err(SkippedDraw::Protocol);
-            };
-            let stencil = self.onscreen_stencil.as_ref().map(|s| &s.view);
-            (view, None, stencil)
-        };
 
         let pipeline = self.pipelines.get(key);
         let vertex_buffer = self.vertex_stream.buffer();
@@ -2017,42 +2087,62 @@ impl WgpuRenderDevice {
         let ps_bg = &self.uniforms.ps_bind_group;
         let paint_bg = &self.texture_groups[&paint_key];
         let image_bg = &self.texture_groups[&image_key];
-        let Some(encoder) = self.encoder.as_mut() else {
-            warn_once!("draw with no open command encoder; skipping");
+        let reuse = !clear_stencil && self.pass.as_ref().is_some_and(|open| open.target == target);
+        if !reuse {
+            self.pass = None;
+            let Some(encoder) = self.encoder.as_mut() else {
+                warn_once!("draw with no open command encoder; skipping");
+                return Err(SkippedDraw::Protocol);
+            };
+
+            // Later draws load the stencil so the clip stack accumulates.
+            let depth_stencil_attachment =
+                stencil_view.map(|view| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: None,
+                    stencil_ops: Some(wgpu::Operations {
+                        load: if clear_stencil {
+                            wgpu::LoadOp::Clear(0)
+                        } else {
+                            wgpu::LoadOp::Load
+                        },
+                        store: wgpu::StoreOp::Store,
+                    }),
+                });
+
+            let pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("noesis_wgpu draw_batch"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: target_view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.pass = Some(OpenPass {
+                pass,
+                target,
+                scissor: None,
+            });
+        }
+        let Some(open) = self.pass.as_mut() else {
             return Err(SkippedDraw::Protocol);
         };
-
-        // Later draws load the stencil so the clip stack accumulates.
-        let depth_stencil_attachment =
-            stencil_view.map(|view| wgpu::RenderPassDepthStencilAttachment {
-                view,
-                depth_ops: None,
-                stencil_ops: Some(wgpu::Operations {
-                    load: if clear_stencil {
-                        wgpu::LoadOp::Clear(0)
-                    } else {
-                        wgpu::LoadOp::Load
-                    },
-                    store: wgpu::StoreOp::Store,
-                }),
-            });
-
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("noesis_wgpu draw_batch"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: target_view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
+        if open.scissor != scissor {
+            let (x, y, w, h) = scissor.unwrap_or(full);
+            open.pass.set_scissor_rect(x, y, w, h);
+            open.scissor = scissor;
+        }
+        let rpass = &mut open.pass;
         rpass.set_pipeline(pipeline);
         if has_stencil {
             rpass.set_stencil_reference(u32::from(batch.stencil_ref));
@@ -2061,9 +2151,6 @@ impl WgpuRenderDevice {
         rpass.set_bind_group(1, ps_bg, &[ps_offset, ps1_offset]);
         rpass.set_bind_group(2, paint_bg, &[]);
         rpass.set_bind_group(3, image_bg, &[]);
-        if let Some((x, y, w, h)) = scissor {
-            rpass.set_scissor_rect(x, y, w, h);
-        }
         rpass.set_vertex_buffer(
             0,
             vertex_buffer.slice(vertex_offset..vertex_offset + vertex_byte_count),
