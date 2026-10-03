@@ -6,6 +6,8 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-03
+
 ### Changed
 
 - Consecutive draws into the same target share one render pass instead of
