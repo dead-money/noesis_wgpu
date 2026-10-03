@@ -6,6 +6,13 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- Consecutive draws into the same target share one render pass instead of
+  recording a pass each, and a phase uploads its draws' uniforms in one
+  `write_buffer` per ring at `end_*_render` instead of three per draw. Both
+  cut the CPU cost of a draw several times over.
+
 ## [0.2.1] - 2026-10-02
 
 ### Added

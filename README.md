@@ -99,7 +99,7 @@ device.draw_custom_batch(batch, textures, shader);
 ## How it works
 
 - **One shader source.** `noesis.wgsl` covers Noesis's shader set with `#ifdef` branches, the convention of Noesis's own GL shaders. The device strips it down to one variant per Noesis shader and compiles a pipeline the first time a draw needs that shader, render state, vertex format, and stencil combination.
-- **One encoder per phase.** `begin_offscreen_render` and `begin_onscreen_render` each open a command encoder, and the matching `end_*` submits it. Every draw records its own render pass.
+- **One encoder per phase.** `begin_offscreen_render` and `begin_onscreen_render` each open a command encoder, and the matching `end_*` submits it. Consecutive draws into one target share a render pass, and the draws' uniforms reach the GPU in one upload per phase.
 - **Per-draw uniforms.** All of a phase's buffer writes land before its encoder is submitted, so each draw writes its uniforms to its own slot of a ring buffer, which doubles when a phase fills it, and geometry is appended rather than overwritten.
 - **Stencil clipping.** Render targets that ask for one, and the onscreen target, get a `Stencil8` buffer, cleared before the first draw into each target.
 - **MSAA render targets.** A render target created with more than one sample is 4x multisampled and resolved into the texture Noesis samples.
