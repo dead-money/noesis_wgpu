@@ -54,7 +54,8 @@ jobs:
   # through lavapipe, Mesa's software Vulkan driver.
   no-shim:
     name: build • clippy • test (no shim)
-    runs-on: ubuntu-latest
+    # Pinned: lavapipe on the ubuntu-26.04 image (mesa 26.0.8) segfaults in wgpu_suite.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
