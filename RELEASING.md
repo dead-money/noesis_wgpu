@@ -7,9 +7,14 @@
   SDK, so `no shim` builds, lints, and runs the GPU tests there on lavapipe, a
   software Vulkan driver. `doc` sets `DOCS_RS=1`, which makes
   `noesis_runtime`'s build script skip the native build.
-- **`build • clippy • test`** runs with all features on the self-hosted SDK
-  runner (label `noesis-sdk`) for pushes, tags, and same-repo PRs. Fork PRs are
-  skipped.
+
+The SDK jobs run in the private
+[`dead-money/noesis-ci`](https://github.com/dead-money/noesis-ci) repo on the
+self-hosted runner (label `noesis-sdk`), which takes no jobs from public repos.
+Every 15 minutes it polls this repo and runs all-features clippy and
+tests on each new commit on `main` and `release/*`, and the release for each new
+`v*` tag. Results show in that repo's Actions tab, not as checks here, so PRs
+merge on the hosted checks alone.
 
 ## `noesis_runtime` versions
 
@@ -46,7 +51,8 @@ cargo release patch --execute
 It bumps the version, stamps `CHANGELOG.md`, commits, tags `vX.Y.Z`, and
 pushes. It doesn't update the link references at the bottom of
 `CHANGELOG.md`: move the `[Unreleased]` link to the new tag and add the new
-version's compare link by hand. The tag triggers `release.yml` on the SDK
+version's compare link by hand. Within 15 minutes
+`dead-money/noesis-ci` notices the tag and runs its `release.yml` on the SDK
 runner, which tests and publishes through crates.io Trusted Publishing.
 Afterward, check the crate page and the docs.rs build.
 
