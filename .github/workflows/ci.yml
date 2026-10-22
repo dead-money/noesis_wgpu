@@ -12,6 +12,10 @@ env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  # The SDK jobs (all-features clippy and tests, and crates.io releases) run in
+  # the private dead-money/noesis-ci repo, because the self-hosted SDK runner
+  # takes no jobs from public repos. See RELEASING.md.
+
   # No SDK needed, so this runs on hosted runners, including for fork PRs.
   fmt:
     name: fmt
@@ -50,7 +54,8 @@ jobs:
   # through lavapipe, Mesa's software Vulkan driver.
   no-shim:
     name: build • clippy • test (no shim)
-    runs-on: ubuntu-latest
+    # Pinned: lavapipe on the ubuntu-26.04 image (mesa 26.0.8) segfaults in wgpu_suite.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -70,37 +75,3 @@ jobs:
 
       - name: cargo test
         run: cargo test --no-default-features
-
-  # Needs the Noesis SDK, which only the self-hosted runner has. Fork PRs are
-  # skipped so untrusted code never runs there.
-  build-test:
-    name: build • clippy • test
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: [self-hosted, noesis-sdk]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          # Keep target/ for incremental builds.
-          clean: false
-
-      # Runners may have other SDK versions installed; pin the one the crate targets.
-      - name: Verify Noesis SDK version
-        run: |
-          grep -Fxq "3.2.13 (r17073)" "$NOESIS_SDK_DIR/version.txt" || {
-            echo "::error::Runner '$RUNNER_NAME' has an unexpected Noesis SDK at $NOESIS_SDK_DIR:"
-            cat "$NOESIS_SDK_DIR/version.txt"
-            exit 1
-          }
-
-      - name: cargo clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
-
-      - name: cargo nextest run
-        run: cargo nextest run --profile ci --all-features
