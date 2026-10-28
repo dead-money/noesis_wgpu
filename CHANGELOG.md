@@ -6,6 +6,8 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-28
+
 ### Changed
 
 - **Breaking:** targets Noesis Native SDK 4.0.1 (r18228) and `noesis_runtime`
@@ -85,7 +87,8 @@ crate of its own:
 - Fixed: mapping more geometry than the stream's staging buffer held, with a
   length that isn't a multiple of 4, no longer panics at unmap.
 
-[Unreleased]: https://github.com/dead-money/noesis_wgpu/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/dead-money/noesis_wgpu/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/dead-money/noesis_wgpu/compare/v0.2.2...v0.3.0
 [0.2.2]: https://github.com/dead-money/noesis_wgpu/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/dead-money/noesis_wgpu/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/dead-money/noesis_wgpu/compare/v0.1.0...v0.2.0
