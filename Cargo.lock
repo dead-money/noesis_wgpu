@@ -439,9 +439,9 @@ dependencies = [
 
 [[package]]
 name = "noesis_runtime"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae9ff99066e1516242e5bc348324c840108962a04b92259ccf6ae9cd9b9e8edd"
+checksum = "d8737e0f00d16e46e0a39334f392190f923dd24f85559ab2237cf4b34110cb0e"
 dependencies = [
  "cc",
 ]

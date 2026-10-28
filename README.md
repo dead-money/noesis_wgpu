@@ -8,13 +8,11 @@ A [wgpu](https://wgpu.rs/) render device for the [Noesis GUI](https://www.noesis
 
 It works with the Rust bindings in [`noesis_runtime`](https://github.com/dead-money/noesis_runtime), and also without them, for a host that loads Noesis another way and forwards the device calls. [`noesis_bevy`](https://github.com/dead-money/noesis_bevy) uses it to render Noesis in Bevy.
 
-Built for Dead Money's own games and mostly written by AI agents under human direction.
-
 ## You need a Noesis license
 
 With the default `shim` feature, this crate links the [Noesis Native SDK](https://www.noesisengine.com/) through `noesis_runtime`. The SDK is closed-source commercial software from Noesis Technologies S.L. that we don't redistribute. Buy it separately and point `NOESIS_SDK_DIR` at your install.
 
-This release targets **Noesis Native SDK 3.2.13**, the version `noesis_runtime` is built against.
+This release targets **Noesis Native SDK 4.0.1 (r18228)** through `noesis_runtime` 0.14.
 
 Without the `shim` feature, nothing here or in `noesis_runtime` touches the SDK: the build needs no `NOESIS_SDK_DIR` and links no Noesis library.
 
@@ -22,8 +20,8 @@ Without the `shim` feature, nothing here or in `noesis_runtime` touches the SDK:
 
 ```toml
 [dependencies]
-noesis_runtime = "0.13"
-noesis_wgpu = "0.2"
+noesis_runtime = "0.14"
+noesis_wgpu = "0.3"
 wgpu = "30"
 ```
 
@@ -67,8 +65,8 @@ A host that receives Noesis's render-device calls some other way, such as a C# `
 
 ```toml
 [dependencies]
-noesis_runtime = { version = "0.13", default-features = false }
-noesis_wgpu = { version = "0.2", default-features = false }
+noesis_runtime = { version = "0.14", default-features = false }
+noesis_wgpu = { version = "0.3", default-features = false }
 ```
 
 That host creates Noesis's texture objects, so it knows which `TextureHandle` each texture pointer in a `Batch` stands for. It passes them with the batch:
@@ -112,18 +110,22 @@ What it doesn't do yet: the `SDF_LCD_*` shaders other than `SDF_LCD_SOLID`, the 
 
 ## Version compatibility
 
-| noesis_wgpu | wgpu | Bevy (through noesis_bevy) |
-|-------------|------|----------------------------|
-| 0.2         | 30   |                            |
-| 0.1         | 29   | 0.19                       |
+| noesis_wgpu | Noesis Native SDK | noesis_runtime | wgpu | Bevy (through noesis_bevy) |
+|-------------|-------------------|----------------|------|---------------------------|
+| 0.3 | 4.0.1 (r18228) | 0.14 | 30 | 0.20 |
+| 0.2 | 3.2.13 (r17073) | 0.13 | 30 | 0.20 |
+| 0.1 | 3.2.13 (r17073) | 0.13 | 29 | 0.19 |
 
-wgpu types are part of the API, so each wgpu major gets a new `noesis_wgpu` minor. Older lines get fixes on `release/0.N` branches while a `noesis_bevy` release still uses them.
+Both wgpu and Noesis ABI changes require a new crate minor. Older lines remain
+available for their matching SDK and wgpu versions.
 
 ## Building
 
+The 4.0.1 download retains `4.0.0` in its archive filename.
+
 ```sh
-unzip NoesisGUI-NativeSDK-linux-3.2.13-Indie.zip -d ~/sdks/noesis-3.2.13
-export NOESIS_SDK_DIR=~/sdks/noesis-3.2.13
+unzip NoesisGUI-NativeSDK-linux-4.0.0-Indie.zip -d ~/sdks/noesis-4.0.1
+export NOESIS_SDK_DIR=~/sdks/noesis-4.0.1
 cargo test
 ```
 

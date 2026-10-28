@@ -18,7 +18,8 @@ Noesis hands a `RenderDevice`, on a wgpu device and queue the caller owns.
   path) and is skipped.
 - **SDK never in the repo.** It lives at `$NOESIS_SDK_DIR` (per-developer
   licensed); never commit any SDK content.
-- **Release lines follow wgpu majors.** `main` is on the newest wgpu;
+- **Release lines follow wgpu majors and Noesis ABI versions.** `main` tracks
+  the newest SDK and wgpu;
   `release/0.N` branches carry older ones for `noesis_bevy`. See
   [`RELEASING.md`](./RELEASING.md).
 

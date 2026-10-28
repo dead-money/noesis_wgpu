@@ -6,6 +6,12 @@ pre-1.0, any `0.x` release may contain breaking changes.
 
 ## [Unreleased]
 
+### Changed
+
+- **Breaking:** targets Noesis Native SDK 4.0.1 (r18228) and `noesis_runtime`
+  0.14. Device capabilities use the four-byte native layout; wgpu remains 30.
+- The README compatibility table includes the Noesis SDK and runtime versions.
+
 ## [0.2.2] - 2026-10-03
 
 ### Changed
