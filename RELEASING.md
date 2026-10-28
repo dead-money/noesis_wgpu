@@ -12,7 +12,7 @@ The SDK jobs run in the private
 [`dead-money/noesis-ci`](https://github.com/dead-money/noesis-ci) repo on the
 self-hosted runner (label `noesis-sdk`), which takes no jobs from public repos.
 Every 15 minutes it polls this repo and runs all-features clippy and
-tests on each new commit on `main` and `release/*`, and the release for each new
+tests on each new commit on `main` and `release/*`, and release validation for each new
 `v*` tag. Results show in that repo's Actions tab, not as checks here, so PRs
 merge on the hosted checks alone.
 
@@ -29,10 +29,10 @@ cargo test --config 'patch.crates-io.noesis_runtime.path="../noesis_runtime"'
 
 ## Release lines
 
-wgpu types are part of the API, so each wgpu major gets its own minor:
+wgpu types and the Noesis ABI are part of the API, so changes to either get a new minor:
 
-- `main` tracks the newest wgpu.
-- `release/0.N` keeps an older line for `noesis_bevy`, which follows Bevy's
+- `main` tracks the newest Noesis SDK and wgpu.
+- `release/0.N` keeps an older SDK/wgpu line for `noesis_bevy`, which follows Bevy's
   wgpu. Cherry-pick fixes onto it only when a `noesis_bevy` release needs them.
 
 Update the version table in `README.md` when a line starts or ends.
@@ -49,11 +49,23 @@ cargo release patch --execute
 ```
 
 It bumps the version, stamps `CHANGELOG.md`, commits, tags `vX.Y.Z`, and
-pushes. It doesn't update the link references at the bottom of
-`CHANGELOG.md`: move the `[Unreleased]` link to the new tag and add the new
-version's compare link by hand. Within 15 minutes
-`dead-money/noesis-ci` notices the tag and runs its `release.yml` on the SDK
-runner, which tests and publishes through crates.io Trusted Publishing.
-Afterward, check the crate page and the docs.rs build.
+pushes, including the changelog compare links. The private `dead-money/noesis-ci` poller validates the tag on the SDK runner.
+Run its `poll.yml` manually to start immediately. After that run succeeds,
+confirm the exact tag SHA and dispatch this repository's `release.yml`:
+
+```sh
+tag=vX.Y.Z
+sha=$(git rev-parse "$tag^{commit}")
+gh workflow run release.yml --repo dead-money/noesis_wgpu --ref main \
+  -f tag="$tag" -f sha="$sha" \
+  -f sdk_run="https://github.com/dead-money/noesis-ci/actions/runs/<successful-run-id>"
+```
+
+The release operator must check the private run succeeded for this exact source;
+the public workflow records that URL and checks tag identity, but cannot read
+private CI results itself. Publishing runs on a hosted runner with `--no-verify`
+because the native build and tests already passed on the SDK runner. The trusted
+publisher is `dead-money/noesis_wgpu`, workflow `release.yml`, no environment.
+Afterward, check the crate pages and docs.rs builds.
 
 Keep `## [Unreleased]` in `CHANGELOG.md` current as PRs land.

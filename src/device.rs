@@ -1246,7 +1246,6 @@ impl WgpuRenderDevice {
     /// with y up.
     pub fn caps(&self) -> DeviceCaps {
         DeviceCaps {
-            center_pixel_offset: 0.0,
             linear_rendering: false,
             // SDF_LCD_SOLID exists, but turning this on makes Noesis emit the
             // whole SDF_LCD_* family: most variants are unported, all need
